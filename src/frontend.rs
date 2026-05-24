@@ -2,15 +2,13 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use prost::Message;
-use serde::Deserialize;
 
 mod onnx_proto {
     include!(concat!(env!("OUT_DIR"), "/onnx.rs"));
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Debug)]
 pub enum DType {
-    #[serde(rename = "bfloat16")]
     BFloat16,
 }
 
@@ -34,33 +32,20 @@ impl std::fmt::Debug for MHAWeights {
     }
 }
 
-#[derive(Deserialize, Debug)]
-#[serde(tag = "type")]
+#[derive(Debug)]
 pub enum HighLevelOp {
     MultiHeadAttention {
         _num_heads: u32,
         embed_dim: u32,
         _seq_len: u32,
         _dtype: DType,
-        #[serde(skip)]
         weights: Option<MHAWeights>,
     },
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Debug)]
 pub struct Model {
     pub ops: Vec<HighLevelOp>,
-}
-
-pub fn _parse_model(path: &str) -> Model {
-    let model_file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) => panic!("File could not be opened: {e}"),
-    };
-    match serde_json::from_reader(model_file) {
-        Ok(m) => m,
-        Err(e) => panic!("could not match Model data structure: {e}"),
-    }
 }
 
 pub fn parse_onnx(onnx_path: &str) -> Model {

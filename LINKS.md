@@ -1,12 +1,11 @@
 # Reference Links
 
-## For M1 — Frontend / JSON Parsing
+## For M1 — Frontend / ONNX Parsing
 
 | Resource | URL | Notes |
 |----------|-----|-------|
-| serde docs | https://serde.rs | Read "Deriving" and "Enum representations" |
-| serde_json docs | https://docs.rs/serde_json | `from_str`, `from_reader`, typed vs `Value` |
 | ONNX Operator Spec | https://onnx.ai/onnx/operators/ | MatMul and Conv ops — industry vocabulary for describing ML ops |
+| prost docs | https://docs.rs/prost | Protobuf decode — `Message::decode`, generated types |
 
 ## Compiler Architecture / IR Design
 

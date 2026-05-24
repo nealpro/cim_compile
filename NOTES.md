@@ -1,41 +1,27 @@
 # cim-compile Notes
 
-## Current State (2026-05-20)
+## Current State (2026-05-24)
 
-### Setup complete
-- `Cargo.toml`: `serde` + `serde_json` added
-- `model.json`: MultiHeadAttention example — 512-dim, 8 heads, seq_len=128, bfloat16
-- `LINKS.md`: reference links organized by milestone
-- `src/frontend.rs`: `parse_model` implemented with `serde_json::from_reader`
-- `src/main.rs`: calls `parse_model`, prints result with `{:?}`
+### All milestones complete
+M6: README.md written — hardware model, pipeline diagram, quick start, output artifact format, source layout.
 
-### Active milestone: M4
-Binary weight file — write `crossbar_weights.bin` for one (or all) 128×128 tiles.
+### Pipeline status
+- `src/frontend.rs` — `parse_onnx` decodes ONNX protobuf, reads 4 × [512×512] bfloat16 weight tensors from external `.data` file via prost
+- `src/middle.rs` — `tile()` slices each 512×512 matrix into 4×4 grid of 128×128 tiles → 64 `ProjectionTile` ops
+- `src/backend.rs` — `emit_asm` / `write_asm` emit `output.s`; `write_weights` emits `crossbar_weights.bin`
+- `src/backend/optimizer.rs` — `peephole` pass: folds `Andi + Srli + Slli` into `Andi + net-shift` (3 → 2 instructions)
+- `src/main.rs` — calls all three stages, writes both output files
 
-### M3 done
-`src/backend.rs` emits `output.s`: RV32I loop over all `LowLevelOp` tiles.
-- `emit_asm(&[LowLevelOp]) -> String` — pure codegen
-- `write_asm(&[LowLevelOp], &Path)` — writes to disk
-- MMIO dispatch: `sw tile_idx, 0(VMM_CTRL)` → trigger; `lw 4(VMM_CTRL)` → ADC result
-- Partial accumulation: `andi/srli/slli` computes row_tile byte offset; assumes tile_rows == tile_cols
-- Tile count comes from `ops.len()`, not hardcoded; full tile schedule emitted as comments
-
-### ONNX ingestion complete
-`src/frontend.rs` now has `parse_onnx("data/memristor_mha_unrolled.onnx")` which:
-- Decodes the protobuf with prost (field numbers match onnx.proto3 exactly)
-- Finds the 4 [512×512] bfloat16 initializers (data_type=16) in graph order
-- Reads their bytes from the external `.data` file via offset+length
-- Populates `MHAWeights { wq, wk, wv, wo }` on `HighLevelOp::MultiHeadAttention`
-
-`src/middle.rs` `tile()` now calls `extract_tile()` per ProjectionTile, slicing the
-full 512×512 raw byte matrix into 128×128 chunks (32,768 bytes each, row-major bfloat16).
-
-Infrastructure: `prost = "0.14.3"`, `prost-build`, `protoc-bin-vendored = "3"`,
-`build.rs`, `proto/onnx_minimal.proto3`.
+### Output artifacts
+- `output.s` — RV32I assembly, 11-instruction loop over 64 tiles, MMIO dispatch + partial-sum accumulation
+- `crossbar_weights.bin` — 2MB, magic `CiMW` + 24-byte header, 64 tiles in dispatch order (matching loop)
 
 ---
 
 ## Design Decisions
+
+### Frontend: ONNX only
+Originally had a JSON frontend (`serde` + `serde_json`, `model.json`, `parse_model`). Superseded by ONNX/prost ingestion. `serde` and `serde_json` dependencies removed. JSON schema was internally-tagged enum dispatch; no longer relevant.
 
 ### HighLevelOp: MultiHeadAttention
 Single op type for the MVP. MHA chosen because:
@@ -44,16 +30,9 @@ Single op type for the MVP. MHA chosen because:
 
 ### BFLOAT16 only
 16-bit format with 8-exponent bits — same dynamic range as float32, standard for CiM hardware.
-The compiler should hard-reject any other dtype at parse time.
-
-### JSON schema (internally tagged)
-```json
-{ "type": "MultiHeadAttention", "num_heads": 8, "embed_dim": 512, "seq_len": 128, "dtype": "bfloat16" }
-```
-Uses serde's `#[serde(tag = "type")]` for enum dispatch. `head_dim` is derived: `embed_dim / num_heads = 64`.
 
 ### Hardware spec lives in `src/hardware.rs`
-`CrossbarSpec` struct holds `tile_rows` and `tile_cols`. Instantiated with `CrossbarSpec::default_128x128()` and passed into `tile()` as `&CrossbarSpec`. Keeps the hardware constant out of model parameters — changing crossbar size means changing one place.
+`CrossbarSpec` holds `tile_rows` and `tile_cols`. `CrossbarSpec::default_128x128()` passed into `tile()`. Crossbar size is one-place-to-change.
 
 ### Crossbar sizing (128×128 constraint)
 
@@ -62,6 +41,14 @@ Uses serde's `#[serde(tag = "type")]` for enum dispatch. `head_dim` is derived: 
 | W_Q/K/V/O proj     | 512×512               | no — needs 4×4 tiling |
 | per-head QK^T      | [128×64] × [64×128]   | yes            |
 | per-head Attn×V    | [128×128] × [128×64]  | yes            |
+
+### Instruction AST in backend
+`Reg`, `Imm`, `Instr` enums with `Display` + constructor functions mirror the Cranelift/LLVM builder pattern. Section functions (`prologue`, `loop_body`, `epilogue`) return `Vec<Instr>`; a single `render` pass produces text. Enables the peephole optimizer to operate on typed data rather than strings.
+
+### Peephole: shift-fold
+`andi T4, T0, 0xF + srli T4, T4, 2 + slli T4, T4, 8` → `andi T4, T0, 0xC + slli T4, T4, 6`.
+General rule: new\_mask = mask & !((1 << srli\_amt) - 1); net shift = slli\_amt - srli\_amt.
+Handles b > a (net slli), b < a (net srli), b == a (mask only). Implemented in `src/backend/optimizer.rs`.
 
 ---
 
@@ -72,6 +59,6 @@ Uses serde's `#[serde(tag = "type")]` for enum dispatch. `head_dim` is derived: 
 | M1 | `model.json` → `Vec<HighLevelOp>` parses and prints | done |
 | M2 | Tiling pass → `Vec<LowLevelOp>` for MHA projections | done |
 | M3 | RISC-V assembly text file written for a simple loop | done |
-| M4 | Binary weight file written for one 128×128 tile | not started |
-| M5 | CLI wires frontend → middle-end → backend end-to-end | not started |
-| M6 | Example `model.json` in repo, README explains the pipeline | not started |
+| M4 | Binary weight file written for one 128×128 tile | done |
+| M5 | CLI wires frontend → middle-end → backend end-to-end | done |
+| M6 | Example `model.json` in repo, README explains the pipeline | done |

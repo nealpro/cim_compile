@@ -1,6 +1,7 @@
-use crate::middle::LowLevelOp;
+use crate::middle::{LowLevelOp, Projection};
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 mod optimizer;
@@ -10,7 +11,7 @@ const ACCUM_BUF_BASE: u32 = 0x2000_0000;
 
 // ── Immediate operand ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Imm {
     Dec(i32),
     Hex(u32),
@@ -239,4 +240,50 @@ pub fn emit_asm(ops: &[LowLevelOp]) -> String {
 
 pub fn write_asm(ops: &[LowLevelOp], path: &Path) -> std::io::Result<()> {
     fs::write(path, emit_asm(ops))
+}
+
+// Binary weight file format:
+//   [0..4]   magic        b"CiMW"
+//   [4]      version      1u8
+//   [5..7]   padding
+//   [7]      dtype        16u8  (bfloat16)
+//   [8..12]  num_tiles    u32 LE
+//   [12..16] tile_rows    u32 LE
+//   [16..20] tile_cols    u32 LE
+//   [20..24] padding
+//   per tile:
+//     [0]    projection   0=WQ 1=WK 2=WV 3=WO
+//     [1]    row          u8
+//     [2]    col          u8
+//     [3]    padding
+//     [4..]  weights      tile_rows × tile_cols × 2 bytes (bfloat16 row-major)
+pub fn write_weights(ops: &[LowLevelOp], path: &Path) -> std::io::Result<()> {
+    let mut w = BufWriter::new(File::create(path)?);
+
+    w.write_all(b"CiMW")?;
+    w.write_all(&[1u8, 0, 0, 16u8])?;                  // version, pad, pad, dtype
+    w.write_all(&(ops.len() as u32).to_le_bytes())?;
+    w.write_all(&128u32.to_le_bytes())?;                // tile_rows
+    w.write_all(&128u32.to_le_bytes())?;                // tile_cols
+    w.write_all(&[0u8; 4])?;                            // padding to 24 bytes
+
+    for op in ops {
+        match op {
+            LowLevelOp::ProjectionTile { projection, row, col, weights } => {
+                w.write_all(&[proj_id(*projection), *row as u8, *col as u8, 0])?;
+                w.write_all(weights)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn proj_id(p: Projection) -> u8 {
+    match p {
+        Projection::WQ => 0,
+        Projection::WK => 1,
+        Projection::WV => 2,
+        Projection::WO => 3,
+    }
 }

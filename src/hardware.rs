@@ -4,10 +4,11 @@ pub struct CrossbarSpec {
 }
 
 impl CrossbarSpec {
-    pub fn default_128x128() -> Self {
+    pub fn new(size: u32) -> Self {
         CrossbarSpec {
-            tile_rows: 128,
-            tile_cols: 128,
+            tile_rows: size,
+            tile_cols: size,
         }
     }
+
 }

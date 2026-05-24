@@ -1,4 +1,4 @@
-use crate::frontend::HighLevelOp;
+use crate::frontend::{HighLevelOp, MHAWeights};
 use crate::hardware::CrossbarSpec;
 
 #[derive(Debug, Clone, Copy)]
@@ -38,33 +38,48 @@ impl std::fmt::Debug for LowLevelOp {
 pub fn tile(ops: Vec<HighLevelOp>, spec: &CrossbarSpec) -> Vec<LowLevelOp> {
     ops.into_iter()
         .flat_map(|op| match op {
-            HighLevelOp::MultiHeadAttention {
-                embed_dim, weights, ..
-            } => {
+            HighLevelOp::MultiHeadAttention { embed_dim, weights, .. } => {
                 let weights = weights.expect("weights required — use parse_onnx, not parse_model");
-                let row_tiles = embed_dim / spec.tile_rows;
-                let col_tiles = embed_dim / spec.tile_cols;
-                let tile_size = spec.tile_rows as usize;
-                let full_cols = embed_dim as usize;
-                let mut tiles = Vec::new();
-                for (proj, matrix) in [
-                    (Projection::WQ, &weights.wq),
-                    (Projection::WK, &weights.wk),
-                    (Projection::WV, &weights.wv),
-                    (Projection::WO, &weights.wo),
-                ] {
-                    for row in 0..row_tiles {
-                        for col in 0..col_tiles {
-                            tiles.push(LowLevelOp::ProjectionTile {
-                                projection: proj,
-                                row,
-                                col,
-                                weights: extract_tile(matrix, full_cols, row, col, tile_size),
-                            });
-                        }
-                    }
-                }
-                tiles
+                let plan = build_plan(embed_dim, spec);
+                slice_tiles(&plan, &weights, embed_dim as usize, spec.tile_rows as usize)
+            }
+        })
+        .collect()
+}
+
+fn build_plan(embed_dim: u32, spec: &CrossbarSpec) -> Vec<(Projection, u32, u32)> {
+    let row_tiles = embed_dim / spec.tile_rows;
+    let col_tiles = embed_dim / spec.tile_cols;
+    let mut plan = Vec::new();
+    for proj in [Projection::WQ, Projection::WK, Projection::WV, Projection::WO] {
+        for row in 0..row_tiles {
+            for col in 0..col_tiles {
+                plan.push((proj, row, col));
+            }
+        }
+    }
+    plan
+}
+
+fn slice_tiles(
+    plan: &[(Projection, u32, u32)],
+    weights: &MHAWeights,
+    full_cols: usize,
+    tile_size: usize,
+) -> Vec<LowLevelOp> {
+    plan.iter()
+        .map(|&(projection, row, col)| {
+            let matrix = match projection {
+                Projection::WQ => &weights.wq,
+                Projection::WK => &weights.wk,
+                Projection::WV => &weights.wv,
+                Projection::WO => &weights.wo,
+            };
+            LowLevelOp::ProjectionTile {
+                projection,
+                row,
+                col,
+                weights: extract_tile(matrix, full_cols, row, col, tile_size),
             }
         })
         .collect()
