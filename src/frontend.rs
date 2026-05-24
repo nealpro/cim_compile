@@ -38,10 +38,10 @@ impl std::fmt::Debug for MHAWeights {
 #[serde(tag = "type")]
 pub enum HighLevelOp {
     MultiHeadAttention {
-        num_heads: u32,
+        _num_heads: u32,
         embed_dim: u32,
-        seq_len: u32,
-        dtype: DType,
+        _seq_len: u32,
+        _dtype: DType,
         #[serde(skip)]
         weights: Option<MHAWeights>,
     },
@@ -52,7 +52,7 @@ pub struct Model {
     pub ops: Vec<HighLevelOp>,
 }
 
-pub fn parse_model(path: &str) -> Model {
+pub fn _parse_model(path: &str) -> Model {
     let model_file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) => panic!("File could not be opened: {e}"),
@@ -97,10 +97,10 @@ pub fn parse_onnx(onnx_path: &str) -> Model {
 
     Model {
         ops: vec![HighLevelOp::MultiHeadAttention {
-            num_heads: 8,
+            _num_heads: 8,
             embed_dim: 512,
-            seq_len: 128,
-            dtype: DType::BFloat16,
+            _seq_len: 128,
+            _dtype: DType::BFloat16,
             weights: Some(MHAWeights { wq, wk, wv, wo }),
         }],
     }

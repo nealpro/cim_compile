@@ -9,8 +9,16 @@
 - `src/frontend.rs`: `parse_model` implemented with `serde_json::from_reader`
 - `src/main.rs`: calls `parse_model`, prints result with `{:?}`
 
-### Active milestone: M3
-RISC-V assembly text file — write `output.s` with a loop that iterates over the 64 projection tiles.
+### Active milestone: M4
+Binary weight file — write `crossbar_weights.bin` for one (or all) 128×128 tiles.
+
+### M3 done
+`src/backend.rs` emits `output.s`: RV32I loop over all `LowLevelOp` tiles.
+- `emit_asm(&[LowLevelOp]) -> String` — pure codegen
+- `write_asm(&[LowLevelOp], &Path)` — writes to disk
+- MMIO dispatch: `sw tile_idx, 0(VMM_CTRL)` → trigger; `lw 4(VMM_CTRL)` → ADC result
+- Partial accumulation: `andi/srli/slli` computes row_tile byte offset; assumes tile_rows == tile_cols
+- Tile count comes from `ops.len()`, not hardcoded; full tile schedule emitted as comments
 
 ### ONNX ingestion complete
 `src/frontend.rs` now has `parse_onnx("data/memristor_mha_unrolled.onnx")` which:
@@ -63,7 +71,7 @@ Uses serde's `#[serde(tag = "type")]` for enum dispatch. `head_dim` is derived: 
 |---|-----------|--------|
 | M1 | `model.json` → `Vec<HighLevelOp>` parses and prints | done |
 | M2 | Tiling pass → `Vec<LowLevelOp>` for MHA projections | done |
-| M3 | RISC-V assembly text file written for a simple loop | in progress |
+| M3 | RISC-V assembly text file written for a simple loop | done |
 | M4 | Binary weight file written for one 128×128 tile | not started |
 | M5 | CLI wires frontend → middle-end → backend end-to-end | not started |
 | M6 | Example `model.json` in repo, README explains the pipeline | not started |

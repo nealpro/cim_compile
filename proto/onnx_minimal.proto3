@@ -1,0 +1,19 @@
+syntax = "proto3";
+package onnx;
+
+message ModelProto { GraphProto graph = 7; }
+
+message GraphProto { repeated TensorProto initializer = 5; }
+
+message TensorProto {
+  repeated int64 dims = 1;
+  int32 data_type = 2;
+  bytes raw_data = 9;
+  repeated StringStringEntryProto external_data = 13;
+  int32 data_location = 14;
+}
+
+message StringStringEntryProto {
+  string key = 1;
+  string value = 2;
+}
