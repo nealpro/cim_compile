@@ -1,2 +1,6 @@
 target/
 data/
+tests/
+notes/
+*.bin
+*.s

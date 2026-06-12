@@ -21,11 +21,11 @@ Analog Compute-In-Memory (CiM) hardware executes vector-matrix multiplication (V
 
 ### What This Tool Does
 
-1. **Frontend** — Parses an ONNX protobuf file (via prost) and lifts the model into a `HighLevelOp` IR. Extracts four 512×512 bfloat16 projection matrices (W_Q, W_K, W_V, W_O) from the external `.data` file.
+1. **Frontend** — Parses an ONNX protobuf file (via prost) and lifts the model into a `HighLevelOp` IR. Extracts four 512×512 bfloat16 projection matrices (W_Q, W_K, W_V, W_O), either from an unrolled export or by splitting PyTorch's fused QKV MHA initializer.
 2. **Middle-end (Tiling Pass)** — Lowers `HighLevelOp` → `LowLevelOp`. Partitions each 512×512 matrix into a 4×4 grid of 128×128 tiles to match the physical crossbar constraint, yielding 64 `ProjectionTile` operations in dispatch order.
 3. **Backend: Assembly Generator** — Walks the `LowLevelOp` list and emits a 10-instruction RV32I loop. Dispatches each tile index to the crossbar via MMIO, reads the ADC-digitized partial sum, and accumulates it in a software buffer.
 4. **Backend: Peephole Optimizer** — Applies a pattern-matching pass on the typed instruction AST, folding `Andi + Srli + Slli` sequences into `Andi + net-shift` (3 instructions → 2) without operating on strings.
-5. **Backend: Weight Serializer** — Writes a structured binary file (`crossbar_weights.bin`) with a 24-byte header and 64 tiles in the same dispatch order as the assembly loop, ensuring the CPU program and weight map are always consistent.
+5. **Backend: Weight Serializer** — Writes a structured binary file (`crossbar_weights.bin`) with a 24-byte header and 64 quantized tiles in the same dispatch order as the assembly loop, ensuring the CPU program and weight map are always consistent.
 
 ---
 
@@ -36,8 +36,8 @@ Analog Compute-In-Memory (CiM) hardware executes vector-matrix multiplication (V
 - **Typed instruction AST** — `Reg`, `Imm`, and `Instr` enums with `Display` and constructor functions mirror the Cranelift/LLVM instruction builder pattern. The optimizer and renderer operate on structured data, not text.
 - **Peephole optimizer** — Pattern-matches a three-instruction shift sequence and collapses it into two instructions using the identity: `new_mask = mask & !((1 << srli_amt) - 1); net_shift = slli_amt − srli_amt`.
 - **Coordinated dual output** — Assembly and binary weight file are generated from the same `Vec<LowLevelOp>` in a single pass, guaranteeing tile-order consistency between the CPU loop and the weight map.
-- **bfloat16 throughout** — Matches the dynamic range of float32 with half the bandwidth; standard for CiM hardware due to analog noise tolerance.
-- **Custom binary format** — `CiMW` magic header, versioned schema, per-tile projection/row/col metadata, row-major bfloat16 weight payload. ~2 MB for 64 tiles.
+- **bfloat16 frontend, int8 crossbar payload** — ONNX weights are read as bfloat16, then lowered to per-tile symmetric int8 by default (`--bits 8`) with a scale factor stored beside each tile.
+- **Custom binary format** — `CiMW` magic header, versioned schema, per-tile projection/row/col metadata, scale factor, and row-major int8 weight payload. ~1 MB for 64 tiles.
 
 ---
 
@@ -66,9 +66,11 @@ cim_compile/
 │   └── backend/
 │       └── optimizer.rs     ← Peephole pass: Andi+Srli+Slli → Andi+net-shift
 ├── data/
-│   ├── onnx_file.py         ← Generates memristor_mha_unrolled.onnx via PyTorch
-│   ├── memristor_mha_unrolled.onnx       ← ONNX model (architecture)
-│   └── memristor_mha_unrolled.onnx.data  ← External weight tensor data
+│   ├── onnx_file.py         ← Generates PyTorch ONNX fixtures
+│   ├── memristor_mha_unrolled.onnx       ← Unrolled Q/K/V/O projection export
+│   ├── memristor_mha_unrolled.onnx.data  ← External weight tensor data
+│   ├── mha_bfloat16.onnx                 ← Fused PyTorch MultiheadAttention export
+│   └── mha_bfloat16.onnx.data            ← External weight tensor data
 ├── build.rs                 ← prost-build invocation for ONNX proto codegen
 ├── NOTES.md                 ← Design decisions and milestone log
 └── LINKS.md                 ← Reference links (specs, papers)
@@ -117,6 +119,9 @@ cargo run --release -- data/memristor_mha_unrolled.onnx -o out/
 
 # Use a different tile size (must evenly divide embed_dim=512)
 cargo run --release -- data/memristor_mha_unrolled.onnx --tile-size 64
+
+# Compile the fused PyTorch MHA export
+cargo run --release -- data/mha_bfloat16.onnx
 ```
 
 ---
@@ -134,6 +139,8 @@ Options:
                               [default: .]
       --tile-size <N>         Crossbar tile dimension; must evenly divide embed_dim
                               [default: 128]
+      --bits <N>              Quantization bit-width for crossbar weights: 4 or 8
+                              [default: 8]
   -h, --help                  Print help
   -V, --version               Print version
 ```
@@ -158,7 +165,7 @@ HighLevelOp::MultiHeadAttention { embed_dim: 512, heads: 8, bfloat16 }
 LowLevelOp::ProjectionTile { projection: WQ|WK|WV|WO, row, col, weights: Vec<u8> }
 ```
 
-`build_plan` enumerates all `(proj, row, col)` combinations: 4 projections × 4 row-tiles × 4 col-tiles = 64 tiles. `extract_tile` performs a strided copy of `tile_size` rows × `tile_size` columns × 2 bytes each from the row-major weight tensor.
+`build_plan` enumerates all `(proj, row, col)` combinations: 4 projections × 4 row-tiles × 4 col-tiles = 64 tiles. `extract_tile` performs a strided copy of `tile_size` rows × `tile_size` columns × 2 bytes each from the row-major weight tensor, then `quantize` converts each bfloat16 tile to one signed integer byte per weight using a per-tile scale.
 
 ### RISC-V code generation and peephole optimization
 
@@ -213,36 +220,28 @@ Target simulators: Spike, QEMU (RV32I).
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 B | Magic: `CiMW` |
-| 4 | 4 B | Version: `1` (u32 LE) |
-| 8 | 4 B | dtype: `16` (bfloat16; matches ONNX `data_type` enum) |
+| 4 | 1 B | Version: `2` |
+| 5 | 2 B | pad |
+| 7 | 1 B | dtype: `8` (int8 quantized payload) |
+| 8 | 4 B | num_tiles: `64` |
 | 12 | 4 B | tile_rows: `128` |
 | 16 | 4 B | tile_cols: `128` |
-| 20 | 4 B | num_tiles: `64` |
+| 20 | 4 B | pad |
 | **per tile × 64** | | |
 | +0 | 1 B | projection: `0`=W_Q, `1`=W_K, `2`=W_V, `3`=W_O |
 | +1 | 1 B | row tile index |
 | +2 | 1 B | col tile index |
 | +3 | 1 B | pad |
-| +4 | 32 768 B | bfloat16 weights, row-major |
+| +4 | 4 B | scale: f32 LE (`w_f32 ≈ q_i8 × scale`) |
+| +8 | 16 384 B | int8 weights, row-major |
 
-Total: `24 + 64 × 32772 = 2 097 432 bytes (~2 MB)`. Tiles appear in dispatch order matching the assembly loop.
+Total: `24 + 64 × 16392 = 1 049 112 bytes (~1 MB)`. Tiles appear in dispatch order matching the assembly loop.
 
 **Example row (tile 0):**
 
 | projection | row | col | weight bytes |
 |---|---|---|---|
-| `0` (W_Q) | `0` | `0` | 32 768 B of bfloat16 values, offset +28 in file |
-
----
-
-## Documentation Index
-
-| Document | Contents |
-|---|---|
-| [NOTES.md](NOTES.md) | Design decisions, milestone log, constraint table |
-| [LINKS.md](LINKS.md) | Reference links: RISC-V ISA spec, MLIR Toy tutorial, CiM literature |
-
----
+| `0` (W_Q) | `0` | `0` | 16 384 B of int8 values, offset +32 in file |
 
 ## License
 

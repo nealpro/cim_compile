@@ -1,3 +1,4 @@
+use crate::hardware::CrossbarSpec;
 use crate::middle::{LowLevelOp, Projection};
 use std::fmt;
 use std::fs::{self, File};
@@ -242,11 +243,11 @@ pub fn write_asm(ops: &[LowLevelOp], path: &Path) -> std::io::Result<()> {
     fs::write(path, emit_asm(ops))
 }
 
-// Binary weight file format:
+// Binary weight file format (version 2):
 //   [0..4]   magic        b"CiMW"
-//   [4]      version      1u8
+//   [4]      version      2u8
 //   [5..7]   padding
-//   [7]      dtype        16u8  (bfloat16)
+//   [7]      dtype        8u8  (int8, after quantization pass)
 //   [8..12]  num_tiles    u32 LE
 //   [12..16] tile_rows    u32 LE
 //   [16..20] tile_cols    u32 LE
@@ -256,21 +257,29 @@ pub fn write_asm(ops: &[LowLevelOp], path: &Path) -> std::io::Result<()> {
 //     [1]    row          u8
 //     [2]    col          u8
 //     [3]    padding
-//     [4..]  weights      tile_rows × tile_cols × 2 bytes (bfloat16 row-major)
-pub fn write_weights(ops: &[LowLevelOp], path: &Path) -> std::io::Result<()> {
+//     [4..8] scale        f32 LE  (dequantization factor: w_f32 ≈ q_i8 * scale)
+//     [8..]  weights      tile_rows × tile_cols × 1 byte (int8 row-major)
+pub fn write_weights(ops: &[LowLevelOp], path: &Path, spec: &CrossbarSpec) -> std::io::Result<()> {
     let mut w = BufWriter::new(File::create(path)?);
 
     w.write_all(b"CiMW")?;
-    w.write_all(&[1u8, 0, 0, 16u8])?;                  // version, pad, pad, dtype
+    w.write_all(&[2u8, 0, 0, 8u8])?; // version=2, pad, pad, dtype=8(int8)
     w.write_all(&(ops.len() as u32).to_le_bytes())?;
-    w.write_all(&128u32.to_le_bytes())?;                // tile_rows
-    w.write_all(&128u32.to_le_bytes())?;                // tile_cols
-    w.write_all(&[0u8; 4])?;                            // padding to 24 bytes
+    w.write_all(&spec.tile_rows.to_le_bytes())?;
+    w.write_all(&spec.tile_cols.to_le_bytes())?;
+    w.write_all(&[0u8; 4])?; // padding to 24 bytes
 
     for op in ops {
         match op {
-            LowLevelOp::ProjectionTile { projection, row, col, weights } => {
+            LowLevelOp::ProjectionTile {
+                projection,
+                row,
+                col,
+                weights,
+                scale,
+            } => {
                 w.write_all(&[proj_id(*projection), *row as u8, *col as u8, 0])?;
+                w.write_all(&scale.to_le_bytes())?;
                 w.write_all(weights)?;
             }
         }

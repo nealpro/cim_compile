@@ -1,20 +1,21 @@
 # cim-compile Notes
 
-## Current State (2026-05-24)
+## Current State (2026-06-12)
 
 ### All milestones complete
-M6: README.md written — hardware model, pipeline diagram, quick start, output artifact format, source layout.
+M6: README.md written and refreshed for quantized v2 weight output plus both bundled ONNX fixture layouts.
 
 ### Pipeline status
-- `src/frontend.rs` — `parse_onnx` decodes ONNX protobuf, reads 4 × [512×512] bfloat16 weight tensors from external `.data` file via prost
-- `src/middle.rs` — `tile()` slices each 512×512 matrix into 4×4 grid of 128×128 tiles → 64 `ProjectionTile` ops
-- `src/backend.rs` — `emit_asm` / `write_asm` emit `output.s`; `write_weights` emits `crossbar_weights.bin`
+- `src/frontend.rs` — `parse_onnx` decodes ONNX protobuf, reads external `.data` tensors via prost, and supports both unrolled 4 × [512×512] projection initializers and fused PyTorch `[1536,512] in_proj_weight` + `[512,512] out_proj.weight`
+- `src/middle.rs` — `tile()` slices each 512×512 matrix into 4×4 grid of 128×128 tiles → 64 `ProjectionTile` ops; `quantize()` lowers bfloat16 tile payloads to signed int8 bytes by default with a per-tile scale
+- `src/backend.rs` — `emit_asm` / `write_asm` emit `output.s`; `write_weights` emits v2 `crossbar_weights.bin` using the active `CrossbarSpec` tile dimensions
 - `src/backend/optimizer.rs` — `peephole` pass: folds `Andi + Srli + Slli` into `Andi + net-shift` (3 → 2 instructions)
-- `src/main.rs` — calls all three stages, writes both output files
+- `src/main.rs` — calls all three stages, validates quantization bits, creates the output directory, and reports readable errors
 
 ### Output artifacts
 - `output.s` — RV32I assembly, 11-instruction loop over 64 tiles, MMIO dispatch + partial-sum accumulation
-- `crossbar_weights.bin` — 2MB, magic `CiMW` + 24-byte header, 64 tiles in dispatch order (matching loop)
+- `crossbar_weights.bin` — ~1MB for the default 128×128 int8 path, magic `CiMW` + 24-byte v2 header, 64 tiles in dispatch order (matching loop)
+- Regression coverage: `cargo test` currently runs 7 unit tests and 2 CLI integration tests covering both bundled ONNX models.
 
 ---
 
@@ -28,11 +29,11 @@ Single op type for the MVP. MHA chosen because:
 - Per-head attention ops (QK^T, Attn×V) are naturally crossbar-shaped at seq_len=128, head_dim=64
 - Projection matrices (512×512) require tiling, which exercises the middle-end pass
 
-### BFLOAT16 only
-16-bit format with 8-exponent bits — same dynamic range as float32, standard for CiM hardware.
+### BFLOAT16 frontend, quantized crossbar payload
+ONNX weights are ingested as bfloat16. The middle-end now applies symmetric per-tile quantization to 4-bit or 8-bit signed integer values; the backend stores the per-tile scale as f32 so the simulated crossbar can reconstruct approximate weights.
 
 ### Hardware spec lives in `src/hardware.rs`
-`CrossbarSpec` holds `tile_rows` and `tile_cols`. `CrossbarSpec::default_128x128()` passed into `tile()`. Crossbar size is one-place-to-change.
+`CrossbarSpec` holds `tile_rows` and `tile_cols`. `CrossbarSpec::new(tile_size)` is passed into tiling and weight serialization, so the binary header reflects the selected tile size.
 
 ### Crossbar sizing (128×128 constraint)
 
