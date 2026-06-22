@@ -1,252 +1,240 @@
-# cim-compile
+# cim_compile
 
 ![Version](https://img.shields.io/badge/version-0.1.0-blue)
-![Language](https://img.shields.io/badge/language-Rust-orange)
-![ISA](https://img.shields.io/badge/target-RV32I-lightgrey)
+![Rust](https://img.shields.io/badge/rust-2024-orange)
+![Target](https://img.shields.io/badge/target-MemTorch%20simulation-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
-
----
 
 ## TL;DR
 
-`cim-compile` is a heterogeneous compiler written in Rust that ingests a multi-head attention ONNX model and simultaneously produces two hardware artifacts: RISC-V assembly for CPU orchestration and a binary weight map for a simulated analog memristor crossbar. Standard ML compilers target homogeneous CPU/GPU backends and have no model for analog in-memory compute; this compiler bridges that gap with a multi-level IR, a hardware-constrained tiling pass, and a dual code-generator that keeps the CPU program and the crossbar weight layout in sync. It is a personal project exploring compiler design for emerging compute-in-memory (CiM) hardware.
-
----
+`cim_compile` is a small local compiler that turns a supported ONNX model into a verified compute-in-memory simulation package. It reads projection-style weights, lowers them into a strict `cim` dialect, and emits the files needed to run those tiles through MemTorch on a normal laptop. The project intentionally supports a narrow slice first, so failures are explicit and the compiler can be tested deeply instead of pretending to handle every ONNX graph.
 
 ## Overview
 
 ### The Problem
 
-Analog Compute-In-Memory (CiM) hardware executes vector-matrix multiplication (VMM) in a single physical step — a weight matrix is encoded as conductance values on a crossbar, and applying an input voltage across the rows produces output currents proportional to the product. This is fundamentally different from a CPU or GPU: the weights live in the hardware itself, and the CPU acts only as an orchestrator dispatching tiles and accumulating partial sums. No existing open compiler toolchain directly targets this execution model for real ONNX models.
+Memristive compute-in-memory systems represent matrix weights as device conductances inside crossbar arrays. That makes the important compiler problem different from normal CPU code generation: the compiler must decide how matrices become crossbar tiles, preserve that schedule, and hand the result to a simulator that understands memristive behavior.
 
 ### What This Tool Does
 
-1. **Frontend** — Parses an ONNX protobuf file (via prost) and lifts the model into a `HighLevelOp` IR. Extracts four 512×512 bfloat16 projection matrices (W_Q, W_K, W_V, W_O), either from an unrolled export or by splitting PyTorch's fused QKV MHA initializer.
-2. **Middle-end (Tiling Pass)** — Lowers `HighLevelOp` → `LowLevelOp`. Partitions each 512×512 matrix into a 4×4 grid of 128×128 tiles to match the physical crossbar constraint, yielding 64 `ProjectionTile` operations in dispatch order.
-3. **Backend: Assembly Generator** — Walks the `LowLevelOp` list and emits a 10-instruction RV32I loop. Dispatches each tile index to the crossbar via MMIO, reads the ADC-digitized partial sum, and accumulates it in a software buffer.
-4. **Backend: Peephole Optimizer** — Applies a pattern-matching pass on the typed instruction AST, folding `Andi + Srli + Slli` sequences into `Andi + net-shift` (3 instructions → 2) without operating on strings.
-5. **Backend: Weight Serializer** — Writes a structured binary file (`crossbar_weights.bin`) with a 24-byte header and 64 quantized tiles in the same dispatch order as the assembly loop, ensuring the CPU program and weight map are always consistent.
-
----
+1. **Frontend** — Reads a small ONNX/prost slice and extracts supported projection, linear, and attention-projection weights.
+2. **Normalization** — Converts supported graph patterns into a local `NormalizedProgram` with projection ops and structural reshape/transpose markers.
+3. **`cim` dialect** — Lowers projections into verified `cim.tile.dispatch` operations with explicit tile and scheduling attributes.
+4. **MemTorch package** — Writes a manifest, quantized tile payloads, and a Python runner that reconstructs a PyTorch model and calls MemTorch patching.
+5. **Simulation run** — Optionally invokes the generated runner with `--run-memtorch` when Torch and MemTorch are installed.
 
 ## Key Features
 
-- **Two-level IR** — `HighLevelOp` (abstract operation, e.g. `MultiHeadAttention`) lowered to `LowLevelOp` (`ProjectionTile`), mirroring the frontend/middle-end split in production compilers like MLIR.
-- **Hardware-constrained tiling** — The 128×128 crossbar limit drives the partitioning math: four column tiles contribute to each 128-element output slice of a 512×512 projection. Tile size is configurable at the CLI.
-- **Typed instruction AST** — `Reg`, `Imm`, and `Instr` enums with `Display` and constructor functions mirror the Cranelift/LLVM instruction builder pattern. The optimizer and renderer operate on structured data, not text.
-- **Peephole optimizer** — Pattern-matches a three-instruction shift sequence and collapses it into two instructions using the identity: `new_mask = mask & !((1 << srli_amt) - 1); net_shift = slli_amt − srli_amt`.
-- **Coordinated dual output** — Assembly and binary weight file are generated from the same `Vec<LowLevelOp>` in a single pass, guaranteeing tile-order consistency between the CPU loop and the weight map.
-- **bfloat16 frontend, int8 crossbar payload** — ONNX weights are read as bfloat16, then lowered to per-tile symmetric int8 by default (`--bits 8`) with a scale factor stored beside each tile.
-- **Custom binary format** — `CiMW` magic header, versioned schema, per-tile projection/row/col metadata, scale factor, and row-major int8 weight payload. ~1 MB for 64 tiles.
-
----
+- **One clean target** — The active path is `ONNX -> normalized IR -> cim dialect -> MemTorch package`; the old RV32I hardware backend is no longer part of the compiler.
+- **Strict dialect verifier** — Rejects invalid tile sizes, non-divisible shapes, out-of-bounds tiles, missing or duplicate orders, inconsistent schedules, bad scales, duplicate coverage, and offset mistakes.
+- **Stable text IR** — `output.cim` has an MLIR-like textual form with parser/printer round-trip tests.
+- **MemTorch-oriented artifacts** — Emits `memtorch_manifest.json`, `memtorch_weights.bin`, and `run_memtorch.py`.
+- **Narrow ONNX support** — Accepts the bundled MHA-style projection fixtures, single rank-2 float projection initializers, and linear `MatMul`/`Gemm` nodes with initializer weights.
+- **Clear unsupported-op diagnostics** — Unsupported ONNX ops fail with the node name and supported-op list.
+- **Tested path** — `cargo test` currently passes 30 / 30 tests across unit, dialect, CLI, and golden-output coverage.
 
 ## Tech Stack
 
 | Layer | Technology |
 |---|---|
-| Language | Rust (edition 2024) |
-| ONNX / protobuf ingestion | [prost](https://github.com/tokio-rs/prost) 0.14 |
-| CLI argument parsing | [clap](https://github.com/clap-rs/clap) 4 (derive API) |
-| Build-time protobuf codegen | prost-build + protoc-bin-vendored |
-| ONNX model generation | Python + PyTorch (`data/onnx_file.py`) |
-
----
+| Language | Rust 2024 |
+| CLI | `clap` 4 derive API |
+| Serialization | `serde` + `serde_json` |
+| ONNX protobuf ingestion | `prost` 0.14 |
+| Protobuf code generation | `prost-build` + `protoc-bin-vendored` |
+| Simulation target | MemTorch via generated Python + PyTorch model reconstruction |
+| Package manager | Cargo |
 
 ## Project Structure
 
-```
+```text
 cim_compile/
 ├── src/
-│   ├── main.rs              ← CLI entry point (clap); wires all three stages
-│   ├── frontend.rs          ← ONNX protobuf → HighLevelOp IR
-│   ├── middle.rs            ← Tiling pass: HighLevelOp → Vec<LowLevelOp>
-│   ├── hardware.rs          ← CrossbarSpec { tile_rows, tile_cols }
-│   ├── backend.rs           ← RV32I codegen + binary weight serializer
-│   └── backend/
-│       └── optimizer.rs     ← Peephole pass: Andi+Srli+Slli → Andi+net-shift
-├── data/
-│   ├── onnx_file.py         ← Generates PyTorch ONNX fixtures
-│   ├── memristor_mha_unrolled.onnx       ← Unrolled Q/K/V/O projection export
-│   ├── memristor_mha_unrolled.onnx.data  ← External weight tensor data
-│   ├── mha_bfloat16.onnx                 ← Fused PyTorch MultiheadAttention export
-│   └── mha_bfloat16.onnx.data            ← External weight tensor data
-├── build.rs                 ← prost-build invocation for ONNX proto codegen
-├── NOTES.md                 ← Design decisions and milestone log
-└── LINKS.md                 ← Reference links (specs, papers)
+│   ├── lib.rs              ← Public `compile_onnx` API
+│   ├── main.rs             ← Thin CLI wrapper
+│   ├── frontend.rs         ← Narrow ONNX parser and normalizer
+│   ├── ir.rs               ← Normalized internal IR
+│   ├── cim.rs              ← Dialect data model, verifier, parser, printer
+│   ├── lowering.rs         ← Tiling, schedule order, quantization, tile payloads
+│   └── memtorch.rs         ← Manifest, weight bytes, generated Python runner
+├── tests/
+│   ├── cim.rs              ← Dialect parser/printer/verifier tests
+│   ├── cli.rs              ← End-to-end CLI artifact tests
+│   ├── golden.rs           ← Exact tiny-projection golden outputs
+│   ├── full.rs             ← Ignored full tests for Torch-generated ONNX
+│   └── generate_onnx_fixtures.py ← Runtime ONNX fixture generator
+├── proto/                  ← Minimal ONNX protobuf schema
+├── build.rs                ← Protobuf codegen setup
+└── LINKS.md                ← Reference links
 ```
-
----
 
 ## Installation
 
-**Prerequisites**
+Prerequisites for compiling artifacts:
 
-- Rust stable (1.80+): [rustup.rs](https://rustup.rs)
-- Python 3.9+ with PyTorch (only needed to regenerate the ONNX model):
-  ```bash
-  pip install torch onnx
-  ```
-
-**Build**
+- Rust stable with edition 2024 support
+- Cargo
 
 ```bash
-git clone <repo>
+git clone <repo-url>
 cd cim_compile
 cargo build --release
+cargo test
 ```
 
----
+Optional prerequisites for full fixture generation or actually running the generated MemTorch simulation:
+
+- Python 3
+- PyTorch
+- ONNX Python package for Torch export
+- MemTorch
+
+MemTorch is documented at [memtorch.readthedocs.io](https://memtorch.readthedocs.io/en/latest/). The default Rust test suite generates minimal ONNX protobuf fixtures with the Python standard library and does not require Torch, ONNX, or MemTorch to be installed; full tests and `--run-memtorch` do.
 
 ## Quick Start
 
-```bash
-# 1. Generate the ONNX model (skip if data/memristor_mha_unrolled.onnx already exists)
-python data/onnx_file.py
-
-# 2. Compile: ONNX → output.s + crossbar_weights.bin
-cargo run --release -- data/memristor_mha_unrolled.onnx
-```
-
-Expected output:
-```
-wrote ./output.s + ./crossbar_weights.bin (64 tiles)
-```
+**Compile the bundled unrolled projection fixture**
 
 ```bash
-# Write artifacts to a specific directory
-cargo run --release -- data/memristor_mha_unrolled.onnx -o out/
-
-# Use a different tile size (must evenly divide embed_dim=512)
-cargo run --release -- data/memristor_mha_unrolled.onnx --tile-size 64
-
-# Compile the fused PyTorch MHA export
-cargo run --release -- data/mha_bfloat16.onnx
+python3 tests/generate_onnx_fixtures.py --output-dir /tmp/cim-fixtures --dim 512
+cargo run --release -- /tmp/cim-fixtures/memristor_mha_unrolled.onnx -o out
 ```
 
----
+**Compile the fused QKV fixture**
 
-## CLI Reference
-
+```bash
+cargo run --release -- /tmp/cim-fixtures/mha_bfloat16.onnx -o out-fused
 ```
+
+**Use a smaller simulated crossbar tile**
+
+```bash
+python3 tests/generate_onnx_fixtures.py --output-dir /tmp/cim-fixtures-64 --dim 64
+cargo run --release -- /tmp/cim-fixtures-64/memristor_mha_unrolled.onnx -o out-64 --tile-size 64
+```
+
+**Run the generated MemTorch path**
+
+```bash
+cargo run --release -- /tmp/cim-fixtures/memristor_mha_unrolled.onnx -o out --run-memtorch
+```
+
+If Python cannot import Torch and MemTorch, the command still writes the compiler artifacts and then reports the missing simulation dependency.
+
+## CLI / API Reference
+
+```text
 cim_compile <ONNX_PATH> [OPTIONS]
 
 Arguments:
-  <ONNX_PATH>          Path to the ONNX model file
+  <ONNX_PATH>              Path to the ONNX model file
 
 Options:
-  -o, --output-dir <DIR>      Output directory for output.s and crossbar_weights.bin
-                              [default: .]
-      --tile-size <N>         Crossbar tile dimension; must evenly divide embed_dim
-                              [default: 128]
-      --bits <N>              Quantization bit-width for crossbar weights: 4 or 8
-                              [default: 8]
-  -h, --help                  Print help
-  -V, --version               Print version
+  -o, --output-dir <DIR>   Output directory for output.cim and MemTorch artifacts [default: .]
+      --tile-size <N>      Square crossbar tile dimension [default: 128]
+      --bits <N>           Quantization bit-width for tile payloads: 4 or 8 [default: 8]
+      --run-memtorch       Run the generated MemTorch script after writing artifacts
+      --python <PYTHON>    Python executable to use with --run-memtorch [default: python3]
+  -h, --help               Print help
+  -V, --version            Print version
 ```
 
----
+Library entry point:
 
-## How It Works
-
-### Analog VMM and why tiling is necessary
-
-A memristor crossbar physically implements vector-matrix multiplication: weight values are stored as conductance levels in a grid of cells, and when an input voltage vector is applied across the rows, Ohm's law (I = V × G) drives a current through each cell. Kirchhoff's current law sums the column currents, producing the full matrix-vector product in a single analog step — no multiply-accumulate loop, no memory bandwidth.
-
-The catch is that the physical crossbar is finite. This model has 128×128 cells. A 512×512 projection matrix (W_Q, W_K, W_V, W_O in a multi-head attention layer) is 16× too large to map onto it directly. The solution is tiling: the middle-end pass partitions each 512×512 matrix into a 4×4 grid of 128×128 sub-matrices. The CPU dispatches each tile index to the crossbar controller via MMIO, reads the ADC-digitized partial sum on each return, and accumulates four column-tile contributions to reconstruct each 128-element output slice.
-
-### IR lowering
-
-```
-HighLevelOp::MultiHeadAttention { embed_dim: 512, heads: 8, bfloat16 }
-  │  middle::build_plan  → 64 (projection, row_tile, col_tile) tuples
-  │  middle::slice_tiles → extract_tile() copies strided bfloat16 rows
-  ▼
-LowLevelOp::ProjectionTile { projection: WQ|WK|WV|WO, row, col, weights: Vec<u8> }
+```rust
+let compilation = cim_compile::compile_onnx(path, cim_compile::CompileConfig::square(128, 8))?;
 ```
 
-`build_plan` enumerates all `(proj, row, col)` combinations: 4 projections × 4 row-tiles × 4 col-tiles = 64 tiles. `extract_tile` performs a strided copy of `tile_size` rows × `tile_size` columns × 2 bytes each from the row-major weight tensor, then `quantize` converts each bfloat16 tile to one signed integer byte per weight using a per-tile scale.
+`Compilation` contains the normalized IR, verified `cim::Program`, and MemTorch package bytes/text.
 
-### RISC-V code generation and peephole optimization
+## Core Algorithm / How It Works
 
-The backend builds a typed instruction AST (`Vec<Instr>`) using constructor functions, then runs a peephole pass before rendering to text. The key optimization folds this 3-instruction sequence:
+The compiler treats each supported projection matrix as a sheet of weights that must be cut into crossbar-sized tiles. Each tile gets a deterministic schedule order and byte offset. The generated MemTorch runner reconstructs a PyTorch `Linear` layer from those tile bytes, then asks MemTorch to patch the layer into a memristive simulation model.
 
-```asm
-andi  t4, t0, 0xf    # isolate column-tile bits
-srli  t4, t4, 2      # right-shift
-slli  t4, t4, 8      # left-shift to byte offset
+Technical flow:
+
+```text
+ONNX graph/initializers
+  -> NormalizedProgram
+  -> verified cim::Program
+  -> MemTorch manifest + quantized tile bytes + Python runner
 ```
 
-into 2 instructions:
+Example `cim` operation:
 
-```asm
-andi  t4, t0, 0xc    # new_mask = 0xf & ~((1<<2)-1) = 0xc
-slli  t4, t4, 6      # net shift = 8 - 2 = 6
+```text
+cim.tile.dispatch { projection = "wq", tile = [0, 0], matrix_shape = [512, 512], tile_size = [128, 128], weight_offset = 0, quant_scale = 0.007874016, order = 0 }
 ```
 
-The general rule: `new_mask = mask & !((1 << srli_amt) - 1)`, `net_shift = slli_amt − srli_amt`. The optimizer handles net left-shift, net right-shift, and equal shifts (mask-only, no shift emitted).
+The offset is into `memtorch_weights.bin`, which stores tile payloads in dispatch order with no legacy hardware header.
 
-**MMIO map:**
+## Configuration
 
-| Address | Purpose |
+There is no config file. The compiler is configured through CLI flags or `CompileConfig`.
+
+| Option | Meaning |
 |---|---|
-| `0x10000000` | VMM control: write tile index, read ADC partial sum |
-| `0x20000000` | Accumulator buffer base |
-
-Target simulators: Spike, QEMU (RV32I).
-
----
+| `--tile-size <N>` | Uses `N x N` tiles; the value must evenly divide each lowered projection matrix. |
+| `--bits <N>` | Quantizes float weights to signed 4-bit or 8-bit ranges, stored as one byte per weight. |
+| `--output-dir <DIR>` | Writes generated artifacts into the selected directory. |
+| `--run-memtorch` | Runs the generated Python script after compiling. |
+| `--python <PYTHON>` | Selects the Python executable for `--run-memtorch`. |
 
 ## Output Reference
 
-### `output.s` — RV32I orchestration loop
+### `output.cim`
 
-```asm
-.loop:
-    sw   t0, 0x0(t2)      # dispatch tile index → crossbar MMIO
-    lw   a0, 0x4(t2)      # read ADC partial sum
-    andi t4, t0, 0xc      # extract column-tile bits (after peephole)
-    slli t4, t4, 6        # byte offset into accumulator buffer (net shift 8-2=6)
-    add  t5, t3, t4       # accumulator slot address
-    lw   a1, 0x0(t5)      # load running sum
-    add  a1, a1, a0       # accumulate partial sum
-    sw   a1, 0x0(t5)      # store updated sum
-    addi t0, t0, 1        # advance tile counter
-    blt  t0, t1, .loop    # loop until all 64 tiles dispatched
+Stable text form of the verified `cim` dialect. This is intended for inspection and parser/verifier round-trip tests.
+
+### `memtorch_manifest.json`
+
+JSON manifest consumed by `run_memtorch.py`.
+
+| Field | Meaning |
+|---|---|
+| `schema_version` | Manifest schema version, currently `1`. |
+| `entry` | Normalized program name. |
+| `tile_size` | `[rows, cols]` tile shape used for all dispatches. |
+| `quant_bits` | Quantization bit-width requested at compile time. |
+| `weights_file` | Relative path to `memtorch_weights.bin`. |
+| `projections` | Projection metadata, bias values if present, and tile records. |
+
+Each tile record includes `row`, `col`, `matrix_shape`, `tile_size`, `weight_offset`, `quant_scale`, and `order`.
+
+### `memtorch_weights.bin`
+
+Raw signed int8 tile payloads in dispatch order. A tile with order `k` starts at:
+
+```text
+k * tile_rows * tile_cols
 ```
 
-### `crossbar_weights.bin` — binary weight map
+### `run_memtorch.py`
 
-| Offset | Size | Field |
-|---|---|---|
-| 0 | 4 B | Magic: `CiMW` |
-| 4 | 1 B | Version: `2` |
-| 5 | 2 B | pad |
-| 7 | 1 B | dtype: `8` (int8 quantized payload) |
-| 8 | 4 B | num_tiles: `64` |
-| 12 | 4 B | tile_rows: `128` |
-| 16 | 4 B | tile_cols: `128` |
-| 20 | 4 B | pad |
-| **per tile × 64** | | |
-| +0 | 1 B | projection: `0`=W_Q, `1`=W_K, `2`=W_V, `3`=W_O |
-| +1 | 1 B | row tile index |
-| +2 | 1 B | col tile index |
-| +3 | 1 B | pad |
-| +4 | 4 B | scale: f32 LE (`w_f32 ≈ q_i8 × scale`) |
-| +8 | 16 384 B | int8 weights, row-major |
+Generated Python runner. It reconstructs PyTorch `Linear` layers from the manifest and weight payloads, then uses MemTorch’s `patch_model` path when the Python environment has the required packages.
 
-Total: `24 + 64 × 16392 = 1 049 112 bytes (~1 MB)`. Tiles appear in dispatch order matching the assembly loop.
+## Testing & Validation
 
-**Example row (tile 0):**
+The current suite passes 30 / 30 tests:
 
-| projection | row | col | weight bytes |
-|---|---|---|---|
-| `0` (W_Q) | `0` | `0` | 16 384 B of int8 values, offset +32 in file |
+```bash
+cargo test
+```
+
+Coverage includes runtime-generated ONNX fixture ingestion, normalized lowering, bfloat16/f32 quantization, schedule generation, offset validation, `cim` parser/printer round trips, verifier failures, CLI success and failure cases, missing MemTorch environment diagnostics, and exact golden outputs for a tiny projection.
+
+Full fixture tests are opt-in because they require Torch and ONNX:
+
+```bash
+CIM_COMPILE_FULL_TESTS=1 cargo test --test full -- --ignored
+```
+
+## Documentation Index
+
+| Document | Contents |
+|---|---|
+| [LINKS.md](LINKS.md) | Reference links for ONNX, MLIR-style IRs, MemTorch, CiM context, and compiler architecture. |
 
 ## License
 
 Released under the [MIT License](LICENSE).
-
----
-
-*Built with Rust. Targets RV32I + analog memristor crossbar hardware.*

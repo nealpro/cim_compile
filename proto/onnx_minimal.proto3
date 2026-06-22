@@ -3,11 +3,41 @@ package onnx;
 
 message ModelProto { GraphProto graph = 7; }
 
-message GraphProto { repeated TensorProto initializer = 5; }
+message GraphProto {
+  repeated NodeProto node = 1;
+  string name = 2;
+  repeated TensorProto initializer = 5;
+  repeated ValueInfoProto input = 11;
+  repeated ValueInfoProto output = 12;
+}
+
+message NodeProto {
+  repeated string input = 1;
+  repeated string output = 2;
+  string name = 3;
+  string op_type = 4;
+  repeated AttributeProto attribute = 5;
+  string domain = 7;
+}
+
+message AttributeProto {
+  string name = 1;
+  float f = 2;
+  int64 i = 3;
+  bytes s = 4;
+  TensorProto t = 5;
+  repeated float floats = 7;
+  repeated int64 ints = 8;
+  int32 type = 20;
+}
+
+message ValueInfoProto { string name = 1; }
 
 message TensorProto {
   repeated int64 dims = 1;
   int32 data_type = 2;
+  repeated float float_data = 4;
+  repeated int32 int32_data = 5;
   string name = 8;
   bytes raw_data = 9;
   repeated StringStringEntryProto external_data = 13;
