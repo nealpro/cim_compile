@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  pull_request:
+    paths-ignore:
+      - "iree"
+      - "iree/**"
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - "iree"
+      - "iree/**"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets --all-features
+
+      - name: Generate coverage
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --workspace --all-targets --all-features --no-report
+          cargo llvm-cov report --html --output-dir target/llvm-cov
+          cargo llvm-cov report --lcov --output-path target/llvm-cov/lcov.info
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            target/llvm-cov/html
+            target/llvm-cov/lcov.info
+          if-no-files-found: error
+          retention-days: 14

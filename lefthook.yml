@@ -1,0 +1,16 @@
+pre-commit:
+  parallel: true
+  commands:
+    fmt:
+      glob: "*.{rs,toml}"
+      run: cargo fmt --all --check
+    check:
+      glob: "*.{rs,toml,proto}"
+      run: cargo check --workspace --all-targets --all-features
+
+pre-push:
+  commands:
+    clippy:
+      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+    test:
+      run: cargo test --workspace --all-targets --all-features
