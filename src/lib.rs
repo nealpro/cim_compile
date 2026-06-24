@@ -2,6 +2,7 @@ pub mod cim;
 pub mod frontend;
 pub mod ir;
 pub mod lowering;
+pub mod mapping;
 pub mod memtorch;
 
 use std::path::Path;

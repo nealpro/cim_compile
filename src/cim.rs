@@ -379,8 +379,8 @@ fn verify_program(program: &Program) -> Result<(), String> {
         }
         seen_orders[op.order as usize] = true;
 
-        let row_tiles = op.matrix_shape.rows / op.tile_size.rows;
-        let col_tiles = op.matrix_shape.cols / op.tile_size.cols;
+        let row_tiles = op.matrix_shape.rows.div_ceil(op.tile_size.rows);
+        let col_tiles = op.matrix_shape.cols.div_ceil(op.tile_size.cols);
         if op.tile.row >= row_tiles || op.tile.col >= col_tiles {
             return Err(format!(
                 "tile [{}, {}] is out of bounds for {}x{} tiles",
@@ -417,7 +417,7 @@ fn verify_program(program: &Program) -> Result<(), String> {
             .get(projection)
             .expect("projection shape exists for covered tiles");
         let expected_tiles =
-            (shape.rows / global_tile_size.rows) * (shape.cols / global_tile_size.cols);
+            shape.rows.div_ceil(global_tile_size.rows) * shape.cols.div_ceil(global_tile_size.cols);
         if tiles.len() != expected_tiles as usize {
             return Err(format!(
                 "projection {projection} covers {} tiles, expected {}",
@@ -447,12 +447,6 @@ fn validate_shape(shape: MatrixShape, tile_size: TileSize) -> Result<(), String>
     }
     if tile_size.rows == 0 || tile_size.cols == 0 {
         return Err("tile_size dimensions must be greater than zero".to_string());
-    }
-    if !shape.rows.is_multiple_of(tile_size.rows) || !shape.cols.is_multiple_of(tile_size.cols) {
-        return Err(format!(
-            "tile_size [{}, {}] must evenly divide matrix_shape [{}, {}]",
-            tile_size.rows, tile_size.cols, shape.rows, shape.cols
-        ));
     }
     Ok(())
 }
