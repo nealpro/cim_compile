@@ -52,6 +52,16 @@ pub struct AttentionBlockPlan {
     pub reason: String,
 }
 
+struct LoweringContext<'a> {
+    config: CompileConfig,
+    tile_size: TileSize,
+    dispatches: &'a mut Vec<TileDispatch>,
+    tiles: &'a mut Vec<LoweredTile>,
+    execution_plan: &'a mut Vec<OperationExecution>,
+    attention_blocks: &'a mut Vec<AttentionBlockPlan>,
+    order: &'a mut u32,
+}
+
 pub fn lower_program(
     program: &NormalizedProgram,
     config: CompileConfig,
@@ -72,63 +82,49 @@ pub fn lower_program(
     let mut attention_blocks = Vec::new();
     let mut order = 0u32;
 
-    for op in &program.ops {
-        match op {
-            NormalizedOp::Projection(projection) => lower_projection(
-                projection,
-                OperationStage::Projection,
-                None,
-                config,
-                tile_size,
-                &mut dispatches,
-                &mut tiles,
-                &mut execution_plan,
-                &mut order,
-            )?,
-            NormalizedOp::Attention(block) => lower_attention_block(
-                block,
-                config,
-                tile_size,
-                &mut dispatches,
-                &mut tiles,
-                &mut execution_plan,
-                &mut attention_blocks,
-                &mut order,
-            )?,
-            NormalizedOp::TinyDecoder(block) => lower_tiny_decoder_block(
-                block,
-                config,
-                tile_size,
-                &mut dispatches,
-                &mut tiles,
-                &mut execution_plan,
-                &mut attention_blocks,
-                &mut order,
-            )?,
-            NormalizedOp::Reshape { name } => {
-                execution_plan.push(OperationExecution {
-                    name: name.clone(),
-                    stage: OperationStage::Reshape.as_str().to_string(),
-                    parent: None,
-                    target: ExecutionTarget::Digital.as_str().to_string(),
-                    reason: "structural reshape stays on the digital path".to_string(),
-                    shape: None,
-                    tile_count: 0,
-                });
-            }
-            NormalizedOp::Transpose { name, perm } => {
-                execution_plan.push(OperationExecution {
-                    name: name.clone(),
-                    stage: OperationStage::Transpose.as_str().to_string(),
-                    parent: None,
-                    target: ExecutionTarget::Digital.as_str().to_string(),
-                    reason: format!(
-                        "transpose {:?} is a structural transform, so it stays digital",
-                        perm
-                    ),
-                    shape: None,
-                    tile_count: 0,
-                });
+    {
+        let mut ctx = LoweringContext {
+            config,
+            tile_size,
+            dispatches: &mut dispatches,
+            tiles: &mut tiles,
+            execution_plan: &mut execution_plan,
+            attention_blocks: &mut attention_blocks,
+            order: &mut order,
+        };
+
+        for op in &program.ops {
+            match op {
+                NormalizedOp::Projection(projection) => {
+                    lower_projection(projection, OperationStage::Projection, None, &mut ctx)?
+                }
+                NormalizedOp::Attention(block) => lower_attention_block(block, &mut ctx)?,
+                NormalizedOp::TinyDecoder(block) => lower_tiny_decoder_block(block, &mut ctx)?,
+                NormalizedOp::Reshape { name } => {
+                    ctx.execution_plan.push(OperationExecution {
+                        name: name.clone(),
+                        stage: OperationStage::Reshape.as_str().to_string(),
+                        parent: None,
+                        target: ExecutionTarget::Digital.as_str().to_string(),
+                        reason: "structural reshape stays on the digital path".to_string(),
+                        shape: None,
+                        tile_count: 0,
+                    });
+                }
+                NormalizedOp::Transpose { name, perm } => {
+                    ctx.execution_plan.push(OperationExecution {
+                        name: name.clone(),
+                        stage: OperationStage::Transpose.as_str().to_string(),
+                        parent: None,
+                        target: ExecutionTarget::Digital.as_str().to_string(),
+                        reason: format!(
+                            "transpose {:?} is a structural transform, so it stays digital",
+                            perm
+                        ),
+                        shape: None,
+                        tile_count: 0,
+                    });
+                }
             }
         }
     }
@@ -147,16 +143,10 @@ pub fn lower_program(
 
 fn lower_tiny_decoder_block(
     block: &TinyDecoderBlock,
-    config: CompileConfig,
-    tile_size: TileSize,
-    dispatches: &mut Vec<TileDispatch>,
-    tiles: &mut Vec<LoweredTile>,
-    execution_plan: &mut Vec<OperationExecution>,
-    attention_blocks: &mut Vec<AttentionBlockPlan>,
-    order: &mut u32,
+    ctx: &mut LoweringContext<'_>,
 ) -> Result<(), String> {
     push_digital_execution(
-        execution_plan,
+        ctx.execution_plan,
         "model.embed_tokens",
         OperationStage::EmbeddingLookup,
         Some(block.name.clone()),
@@ -167,7 +157,7 @@ fn lower_tiny_decoder_block(
         ]),
     );
     push_digital_execution(
-        execution_plan,
+        ctx.execution_plan,
         "model.layers.0.input_layernorm",
         OperationStage::Norm("norm.input_layernorm"),
         Some(block.name.clone()),
@@ -178,7 +168,7 @@ fn lower_tiny_decoder_block(
         ]),
     );
     push_digital_execution(
-        execution_plan,
+        ctx.execution_plan,
         "model.rotary_emb",
         OperationStage::RotaryEmbedding,
         Some(block.name.clone()),
@@ -189,19 +179,10 @@ fn lower_tiny_decoder_block(
         ]),
     );
 
-    lower_attention_block(
-        &block.attention,
-        config,
-        tile_size,
-        dispatches,
-        tiles,
-        execution_plan,
-        attention_blocks,
-        order,
-    )?;
+    lower_attention_block(&block.attention, ctx)?;
 
     push_digital_execution(
-        execution_plan,
+        ctx.execution_plan,
         "model.layers.0.attention_residual",
         OperationStage::Residual("residual.attention"),
         Some(block.name.clone()),
@@ -212,7 +193,7 @@ fn lower_tiny_decoder_block(
         ]),
     );
     push_digital_execution(
-        execution_plan,
+        ctx.execution_plan,
         "model.layers.0.post_attention_layernorm",
         OperationStage::Norm("norm.post_attention_layernorm"),
         Some(block.name.clone()),
@@ -227,26 +208,16 @@ fn lower_tiny_decoder_block(
         &block.mlp_gate_proj,
         OperationStage::Mlp(MlpStage::GateProjection),
         Some(block.name.clone()),
-        config,
-        tile_size,
-        dispatches,
-        tiles,
-        execution_plan,
-        order,
+        ctx,
     )?;
     lower_projection(
         &block.mlp_up_proj,
         OperationStage::Mlp(MlpStage::UpProjection),
         Some(block.name.clone()),
-        config,
-        tile_size,
-        dispatches,
-        tiles,
-        execution_plan,
-        order,
+        ctx,
     )?;
     push_digital_execution(
-        execution_plan,
+        ctx.execution_plan,
         "model.layers.0.mlp.act_fn",
         OperationStage::Mlp(MlpStage::Activation),
         Some(block.name.clone()),
@@ -257,7 +228,7 @@ fn lower_tiny_decoder_block(
         ]),
     );
     push_digital_execution(
-        execution_plan,
+        ctx.execution_plan,
         "model.layers.0.mlp.multiply",
         OperationStage::Mlp(MlpStage::ElementwiseMultiply),
         Some(block.name.clone()),
@@ -271,16 +242,11 @@ fn lower_tiny_decoder_block(
         &block.mlp_down_proj,
         OperationStage::Mlp(MlpStage::DownProjection),
         Some(block.name.clone()),
-        config,
-        tile_size,
-        dispatches,
-        tiles,
-        execution_plan,
-        order,
+        ctx,
     )?;
 
     push_digital_execution(
-        execution_plan,
+        ctx.execution_plan,
         "model.layers.0.mlp_residual",
         OperationStage::Residual("residual.mlp"),
         Some(block.name.clone()),
@@ -291,7 +257,7 @@ fn lower_tiny_decoder_block(
         ]),
     );
     push_digital_execution(
-        execution_plan,
+        ctx.execution_plan,
         "model.norm",
         OperationStage::Norm("norm.final"),
         Some(block.name.clone()),
@@ -302,7 +268,7 @@ fn lower_tiny_decoder_block(
         ]),
     );
     push_digital_execution(
-        execution_plan,
+        ctx.execution_plan,
         "lm_head",
         OperationStage::LmHead,
         Some(block.name.clone()),
@@ -336,18 +302,17 @@ fn lower_projection(
     projection: &ProjectionOp,
     stage: OperationStage,
     parent: Option<String>,
-    config: CompileConfig,
-    tile_size: TileSize,
-    dispatches: &mut Vec<TileDispatch>,
-    tiles: &mut Vec<LoweredTile>,
-    execution_plan: &mut Vec<OperationExecution>,
-    order: &mut u32,
+    ctx: &mut LoweringContext<'_>,
 ) -> Result<(), String> {
-    let decision =
-        choose_projection_target(projection, tile_size.rows, tile_size.cols, config.bits);
+    let decision = choose_projection_target(
+        projection,
+        ctx.tile_size.rows,
+        ctx.tile_size.cols,
+        ctx.config.bits,
+    );
     let tile_count =
-        projection.rows.div_ceil(tile_size.rows) * projection.cols.div_ceil(tile_size.cols);
-    execution_plan.push(OperationExecution {
+        projection.rows.div_ceil(ctx.tile_size.rows) * projection.cols.div_ceil(ctx.tile_size.cols);
+    ctx.execution_plan.push(OperationExecution {
         name: projection.name.clone(),
         stage: stage.as_str().to_string(),
         parent: parent.clone(),
@@ -361,25 +326,25 @@ fn lower_projection(
         return Ok(());
     }
 
-    let row_tiles = projection.rows.div_ceil(tile_size.rows);
-    let col_tiles = projection.cols.div_ceil(tile_size.cols);
+    let row_tiles = projection.rows.div_ceil(ctx.tile_size.rows);
+    let col_tiles = projection.cols.div_ceil(ctx.tile_size.cols);
     for tile_row in 0..row_tiles {
         for tile_col in 0..col_tiles {
             let tile = TileCoord::new(tile_row, tile_col);
-            let values = extract_tile(projection, tile, tile_size)?;
-            let (payload, scale) = quantize_f32_tile(&values, config.bits)?;
-            let weight_offset = expected_weight_offset(*order, tile_size);
+            let values = extract_tile(projection, tile, ctx.tile_size)?;
+            let (payload, scale) = quantize_f32_tile(&values, ctx.config.bits)?;
+            let weight_offset = expected_weight_offset(*ctx.order, ctx.tile_size);
             let matrix_shape = MatrixShape::new(projection.rows, projection.cols);
-            dispatches.push(TileDispatch {
+            ctx.dispatches.push(TileDispatch {
                 projection: projection.kind.clone(),
                 tile,
                 matrix_shape,
-                tile_size,
+                tile_size: ctx.tile_size,
                 weight_offset,
                 quant_scale: scale,
-                order: *order,
+                order: *ctx.order,
             });
-            tiles.push(LoweredTile {
+            ctx.tiles.push(LoweredTile {
                 projection: projection.kind.to_string(),
                 stage: stage.as_str().to_string(),
                 parent: parent.clone(),
@@ -387,15 +352,16 @@ fn lower_projection(
                 reason: decision.reason.clone(),
                 tile,
                 matrix_shape,
-                tile_size,
+                tile_size: ctx.tile_size,
                 weight_offset,
                 quant_scale: scale,
-                order: *order,
+                order: *ctx.order,
                 payload,
             });
-            *order = order
+            let next_order = (*ctx.order)
                 .checked_add(1)
                 .ok_or_else(|| "too many tile dispatches".to_string())?;
+            *ctx.order = next_order;
         }
     }
 
@@ -404,40 +370,28 @@ fn lower_projection(
 
 fn lower_attention_block(
     block: &AttentionBlock,
-    config: CompileConfig,
-    tile_size: TileSize,
-    dispatches: &mut Vec<TileDispatch>,
-    tiles: &mut Vec<LoweredTile>,
-    execution_plan: &mut Vec<OperationExecution>,
-    attention_blocks: &mut Vec<AttentionBlockPlan>,
-    order: &mut u32,
+    ctx: &mut LoweringContext<'_>,
 ) -> Result<(), String> {
     let mut cim_projection_names = Vec::new();
     let mut digital_kernel_names = Vec::new();
     let mut block_reason = Vec::new();
 
     for (stage, projection) in block.projection_entries() {
-        let decision =
-            choose_projection_target(projection, tile_size.rows, tile_size.cols, config.bits);
+        let decision = choose_projection_target(
+            projection,
+            ctx.tile_size.rows,
+            ctx.tile_size.cols,
+            ctx.config.bits,
+        );
         block_reason.push(decision.reason.clone());
         cim_projection_names.push(projection.name.clone());
-        lower_projection(
-            projection,
-            stage,
-            Some(block.name.clone()),
-            config,
-            tile_size,
-            dispatches,
-            tiles,
-            execution_plan,
-            order,
-        )?;
+        lower_projection(projection, stage, Some(block.name.clone()), ctx)?;
     }
 
     for kernel in block.kernel_entries() {
         let decision = choose_attention_target(kernel);
         digital_kernel_names.push(kernel.name.clone());
-        execution_plan.push(OperationExecution {
+        ctx.execution_plan.push(OperationExecution {
             name: kernel.name.clone(),
             stage: OperationStage::Attention(kernel.stage).as_str().to_string(),
             parent: Some(block.name.clone()),
@@ -459,7 +413,7 @@ fn lower_attention_block(
         "digital_only"
     };
 
-    attention_blocks.push(AttentionBlockPlan {
+    ctx.attention_blocks.push(AttentionBlockPlan {
         name: block.name.clone(),
         metadata: block.metadata.clone(),
         mode: mode.to_string(),
@@ -540,7 +494,10 @@ pub fn tile_payload_bytes(tiles: &[LoweredTile]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{AttentionBlock, AttentionKernel, AttentionStage, NormalizedOp};
+    use crate::ir::{
+        AttentionBlock, AttentionKernel, AttentionKernels, AttentionProjections, AttentionStage,
+        NormalizedOp,
+    };
 
     fn tiny_projection_program() -> NormalizedProgram {
         NormalizedProgram::new(
@@ -599,17 +556,29 @@ mod tests {
 
         NormalizedProgram::new(
             "attention",
-            vec![NormalizedOp::Attention(AttentionBlock::new(
+            vec![NormalizedOp::Attention(Box::new(AttentionBlock::new(
                 "mha",
-                q,
-                k,
-                v,
-                AttentionKernel::new("attn_scores", AttentionStage::ScoreMatMul, None),
-                AttentionKernel::new("attn_softmax", AttentionStage::Softmax, None),
-                AttentionKernel::new("attn_context", AttentionStage::ContextMatMul, None),
-                o,
+                AttentionProjections {
+                    q_proj: q,
+                    k_proj: k,
+                    v_proj: v,
+                    out_proj: o,
+                },
+                AttentionKernels {
+                    score_matmul: AttentionKernel::new(
+                        "attn_scores",
+                        AttentionStage::ScoreMatMul,
+                        None,
+                    ),
+                    softmax: AttentionKernel::new("attn_softmax", AttentionStage::Softmax, None),
+                    context_matmul: AttentionKernel::new(
+                        "attn_context",
+                        AttentionStage::ContextMatMul,
+                        None,
+                    ),
+                },
                 None,
-            ))],
+            )))],
         )
     }
 

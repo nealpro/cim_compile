@@ -151,8 +151,8 @@ impl NormalizedProgram {
 #[derive(Debug, Clone, PartialEq)]
 pub enum NormalizedOp {
     Projection(ProjectionOp),
-    Attention(AttentionBlock),
-    TinyDecoder(TinyDecoderBlock),
+    Attention(Box<AttentionBlock>),
+    TinyDecoder(Box<TinyDecoderBlock>),
     Reshape { name: String },
     Transpose { name: String, perm: Vec<i64> },
 }
@@ -218,18 +218,40 @@ pub struct AttentionBlock {
     pub residual: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttentionProjections {
+    pub q_proj: ProjectionOp,
+    pub k_proj: ProjectionOp,
+    pub v_proj: ProjectionOp,
+    pub out_proj: ProjectionOp,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttentionKernels {
+    pub score_matmul: AttentionKernel,
+    pub softmax: AttentionKernel,
+    pub context_matmul: AttentionKernel,
+}
+
 impl AttentionBlock {
     pub fn new(
         name: impl Into<String>,
-        q_proj: ProjectionOp,
-        k_proj: ProjectionOp,
-        v_proj: ProjectionOp,
-        score_matmul: AttentionKernel,
-        softmax: AttentionKernel,
-        context_matmul: AttentionKernel,
-        out_proj: ProjectionOp,
+        projections: AttentionProjections,
+        kernels: AttentionKernels,
         residual: Option<String>,
     ) -> Self {
+        let AttentionProjections {
+            q_proj,
+            k_proj,
+            v_proj,
+            out_proj,
+        } = projections;
+        let AttentionKernels {
+            score_matmul,
+            softmax,
+            context_matmul,
+        } = kernels;
+
         Self {
             name: name.into(),
             metadata: None,
@@ -434,14 +456,14 @@ impl ProjectionOp {
                 expected
             ));
         }
-        if let Some(bias) = &bias {
-            if bias.len() != rows as usize {
-                return Err(format!(
-                    "projection bias has {} elements, expected {}",
-                    bias.len(),
-                    rows
-                ));
-            }
+        if let Some(bias) = &bias
+            && bias.len() != rows as usize
+        {
+            return Err(format!(
+                "projection bias has {} elements, expected {}",
+                bias.len(),
+                rows
+            ));
         }
         Ok(Self {
             name: name.into(),

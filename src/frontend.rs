@@ -6,8 +6,9 @@ use prost::Message;
 
 use crate::cim::ProjectionKind;
 use crate::ir::{
-    AttentionBlock, AttentionKernel, AttentionSliceMetadata, AttentionStage, DigitalTensor,
-    NormalizedOp, NormalizedProgram, ProjectionOp, TinyDecoderBlock, TinyDecoderMetadata,
+    AttentionBlock, AttentionKernel, AttentionKernels, AttentionProjections,
+    AttentionSliceMetadata, AttentionStage, DigitalTensor, NormalizedOp, NormalizedProgram,
+    ProjectionOp, TinyDecoderBlock, TinyDecoderMetadata,
 };
 
 mod onnx_proto {
@@ -105,14 +106,14 @@ fn normalize_graph(
     if let Some(block) = build_tiny_decoder_block(&graph_name, nodes, &tensor_by_name)? {
         return Ok(NormalizedProgram::new(
             graph_name,
-            vec![NormalizedOp::TinyDecoder(block)],
+            vec![NormalizedOp::TinyDecoder(Box::new(block))],
         ));
     }
 
     if let Some(block) = build_named_self_attention_block(&graph_name, nodes, &tensor_by_name)? {
         return Ok(NormalizedProgram::new(
             graph_name,
-            vec![NormalizedOp::Attention(block)],
+            vec![NormalizedOp::Attention(Box::new(block))],
         ));
     }
 
@@ -129,7 +130,7 @@ fn normalize_graph(
             nodes,
             attention_projections.expect("attention candidate must have projections"),
         )?;
-        ops.push(NormalizedOp::Attention(block));
+        ops.push(NormalizedOp::Attention(Box::new(block)));
 
         for node in nodes {
             match node.op_type.as_str() {
@@ -500,25 +501,29 @@ fn build_named_self_attention_block(
 
     let block = AttentionBlock::new(
         block_name,
-        q_proj,
-        k_proj,
-        v_proj,
-        AttentionKernel::new(
-            nodes[score_index].name.clone(),
-            AttentionStage::ScoreMatMul,
-            None,
-        ),
-        AttentionKernel::new(
-            nodes[softmax_index].name.clone(),
-            AttentionStage::Softmax,
-            None,
-        ),
-        AttentionKernel::new(
-            nodes[context_index].name.clone(),
-            AttentionStage::ContextMatMul,
-            None,
-        ),
-        out_proj,
+        AttentionProjections {
+            q_proj,
+            k_proj,
+            v_proj,
+            out_proj,
+        },
+        AttentionKernels {
+            score_matmul: AttentionKernel::new(
+                nodes[score_index].name.clone(),
+                AttentionStage::ScoreMatMul,
+                None,
+            ),
+            softmax: AttentionKernel::new(
+                nodes[softmax_index].name.clone(),
+                AttentionStage::Softmax,
+                None,
+            ),
+            context_matmul: AttentionKernel::new(
+                nodes[context_index].name.clone(),
+                AttentionStage::ContextMatMul,
+                None,
+            ),
+        },
         residual,
     )
     .with_metadata(metadata)
@@ -770,13 +775,17 @@ fn build_attention_block(
 
     Ok(AttentionBlock::new(
         graph_name,
-        q_proj,
-        k_proj,
-        v_proj,
-        score_matmul,
-        softmax,
-        context_matmul,
-        out_proj,
+        AttentionProjections {
+            q_proj,
+            k_proj,
+            v_proj,
+            out_proj,
+        },
+        AttentionKernels {
+            score_matmul,
+            softmax,
+            context_matmul,
+        },
         residual,
     ))
 }

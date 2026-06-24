@@ -1,6 +1,6 @@
 # cim_compile Notes
 
-## Current State (2026-06-23)
+## Current State (2026-06-24)
 
 The active compiler path is:
 
@@ -9,6 +9,8 @@ ONNX -> NormalizedProgram -> verified cim::Program -> MemTorch manifest + CiM ti
 ```
 
 This replaces the earlier RV32I/hardware-artifact path for now. The project is a narrow local-first compiler for one real tiny-decoder token-logits/token-ID-generation slice and a MemTorch simulation package.
+
+CI is configured in `.github/workflows/ci.yml` to run formatting, Clippy with `-D warnings`, the full Rust test suite, and llvm-cov coverage artifact generation. The June 24 failure captured in `ci_logs/logs_75774070239` was a Clippy failure, not a formatting or test failure.
 
 ## Milestone State
 
@@ -36,6 +38,8 @@ This replaces the earlier RV32I/hardware-artifact path for now. The project is a
 - The LM head is intentionally digital for this milestone. It produces logits and greedy token IDs, but the project still does not claim tokenizer support, text generation from strings, non-greedy sampling controls, external KV-cache APIs, or arbitrary LLM inference.
 - MemTorch remains a Python runtime dependency rather than a Rust crate dependency.
 - On this MacBook Air, the validated local path is `memtorch-cpu`; CUDA MemTorch should be validated on a CUDA machine.
+- `NormalizedOp::Attention` and `NormalizedOp::TinyDecoder` use boxed payloads so the enum stays small enough for Clippy's `large_enum_variant` check under CI's `-D warnings` policy.
+- Lowering helper state is grouped into a private context struct so CI can keep `clippy::too_many_arguments` enabled without weakening the workflow.
 
 ## Local Python Environment
 
@@ -63,6 +67,8 @@ The CPU package was installed without its stale `sklearn` dependency alias, then
 - The bridge keeps Matplotlib/cache files under the output directory to avoid unwritable home-cache issues in sandboxed runs.
 
 ## Regression Coverage
+
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo test --workspace --all-targets --all-features` pass locally after the CI cleanup. The CI coverage steps also pass locally: `cargo llvm-cov --workspace --all-targets --all-features --no-report`, `cargo llvm-cov report --html --output-dir target/llvm-cov`, and `cargo llvm-cov report --lcov --output-path target/llvm-cov/lcov.info`.
 
 `cargo test` passes 35 / 35 tests and covers the real `data/model.onnx` token-logits/token-ID-generation fixture, generated minimal fixtures, and the MemTorch-backed full simulation tests.
 

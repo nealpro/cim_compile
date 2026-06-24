@@ -1,9 +1,10 @@
 # cim_compile
 
-![Version](https://img.shields.io/badge/version-0.1.0-blue)
-![Rust](https://img.shields.io/badge/rust-2024-orange)
-![Target](https://img.shields.io/badge/target-MemTorch%20simulation-lightgrey)
-![License](https://img.shields.io/badge/license-MIT-green)
+[![Version](https://img.shields.io/badge/version-0.1.0-blue)](Cargo.toml)
+[![Rust](https://img.shields.io/badge/rust-2024-orange)](rust-toolchain.toml)
+[![CI](https://github.com/nealpro/cim_compile/actions/workflows/ci.yml/badge.svg)](https://github.com/nealpro/cim_compile/actions/workflows/ci.yml)
+[![Target](https://img.shields.io/badge/target-MemTorch%20simulation-lightgrey)](https://memtorch.readthedocs.io/en/latest/)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ## TL;DR
 
