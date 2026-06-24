@@ -10,11 +10,11 @@ ONNX -> NormalizedProgram -> verified cim::Program -> MemTorch manifest + CiM ti
 
 This replaces the earlier RV32I/hardware-artifact path for now. The project is a narrow local-first compiler for one real tiny-decoder token-logits/token-ID-generation slice and a MemTorch simulation package.
 
-CI is configured in `.github/workflows/ci.yml` to run formatting, Clippy with `-D warnings`, the full Rust test suite, and llvm-cov coverage artifact generation. The June 24 failure captured in `ci_logs/logs_75774070239` was a Clippy failure, not a formatting or test failure.
+CI is configured in `.github/workflows/ci.yml` as focused jobs for formatting, Clippy with `-D warnings`, `cargo check`, the default Rust test suite, rustdoc warnings, and llvm-cov coverage artifact generation. Default CI is hermetic and must not require `data/model.onnx` or any model download.
 
 ## Milestone State
 
-- `data/model.onnx` normalizes into one explicit `tiny_decoder_v1` block.
+- The local `data/model.onnx` fixture normalizes into one explicit `tiny_decoder_v1` block when ignored real-model validation tests are run manually.
 - The supported real-model slice includes token embedding lookup, input RMSNorm, Q/K/V projections, rotary position math, score matmul, softmax, context matmul, output projection, attention residual, post-attention RMSNorm, MLP gate/up/down projections, MLP activation/multiply, MLP residual, final RMSNorm, and LM-head logits projection.
 - CiM/MemTorch placement covers Q/K/V/output and MLP gate/up/down projections.
 - Digital PyTorch fallback covers embedding lookup, RMSNorms, rotary math, grouped-query repeat, attention mask/score/softmax/context kernels, MLP activation/multiply, residuals, and the final 32k-vocabulary LM head.
@@ -32,7 +32,8 @@ CI is configured in `.github/workflows/ci.yml` to run formatting, Clippy with `-
 - `memtorch_digital.bin` stores float32 little-endian digital fallback tensors. The manifest records role, shape, dtype, byte offset, and byte length for each tensor.
 - Public-facing wording should describe the project as a narrow tiny-decoder/token-logits CiM compiler, not a general LLM inference engine.
 - ONNX support remains intentionally narrow: the first named decoder layer in `data/model.onnx`, projection-producing `MatMul`/`Gemm` nodes, projection initializer patterns, and structural transformer-adjacent ops needed to reach those weights.
-- `data/model.onnx` is now a required local fixture for the real tiny-model tests. `tests/generate_onnx_fixtures.py` still generates minimal fixtures at test runtime for smaller regression cases.
+- `data/model.onnx` is an ignored local validation fixture, not a CI input. Tests that require it are marked `#[ignore]` and accept `CIM_COMPILE_REAL_MODEL=/path/to/model.onnx`.
+- `tests/generate_onnx_fixtures.py` generates minimal fixtures at test runtime for the mandatory CI regression path.
 - The default crossbar tile is still `128 x 128`, but non-divisible projection shapes are accepted by emitting padded edge tiles. The real token-logits slice emits 60 CiM tile dispatches at `128 x 128`.
 - The manifest includes a simulation summary listing supported runtime modes (`logits`, `generate_ids`), seven MemTorch-patched projection stages, digital fallback stages, and the digital LM-head placement.
 - The LM head is intentionally digital for this milestone. It produces logits and greedy token IDs, but the project still does not claim tokenizer support, text generation from strings, non-greedy sampling controls, external KV-cache APIs, or arbitrary LLM inference.
@@ -68,8 +69,8 @@ The CPU package was installed without its stale `sklearn` dependency alias, then
 
 ## Regression Coverage
 
-`cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo test --workspace --all-targets --all-features` pass locally after the CI cleanup. The CI coverage steps also pass locally: `cargo llvm-cov --workspace --all-targets --all-features --no-report`, `cargo llvm-cov report --html --output-dir target/llvm-cov`, and `cargo llvm-cov report --lcov --output-path target/llvm-cov/lcov.info`.
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo check --workspace --all-targets --all-features`, `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items`, and `cargo test --workspace --all-targets --all-features` pass locally after the CI cleanup. Default tests pass with 31 executed tests and 4 ignored real-model tests, including when `data/model.onnx` is temporarily hidden. The CI coverage steps also pass locally: `cargo llvm-cov --workspace --all-targets --all-features --no-report`, `cargo llvm-cov report --html --output-dir target/llvm-cov`, and `cargo llvm-cov report --lcov --output-path target/llvm-cov/lcov.info`.
 
-`cargo test` passes 35 / 35 tests and covers the real `data/model.onnx` token-logits/token-ID-generation fixture, generated minimal fixtures, and the MemTorch-backed full simulation tests.
+`cargo test` covers generated minimal fixtures, frontend parsing, normalized lowering, tiling and quantization, manifest generation, CLI behavior, `cim` parser/printer/verifier behavior, and golden outputs without requiring `data/model.onnx`.
 
-`cargo test --test full` passes 2 / 2 in the local uv environment and exercises `data/model.onnx` with the checked-in MemTorch token-logits and token-ID-generation bridge.
+Ignored manual validation tests exercise `data/model.onnx` with the checked-in MemTorch token-logits and token-ID-generation bridge when run with `CIM_COMPILE_REAL_MODEL=data/model.onnx cargo test -- --ignored` or `CIM_COMPILE_REAL_MODEL=data/model.onnx cargo test --test full -- --ignored`. Both commands pass in the local uv/MemTorch CPU environment.

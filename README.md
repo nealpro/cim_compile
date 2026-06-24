@@ -28,13 +28,13 @@ Memristive compute-in-memory systems represent matrix weights as device conducta
 
 - **One clean target** — The active path is `ONNX -> normalized IR -> cim dialect -> MemTorch package`; the old RV32I hardware backend is no longer part of the compiler.
 - **Transformer-aware offload** — The supported decoder slice is normalized explicitly, with CiM assigned to static attention/MLP projections and digital fallback recorded for dynamic kernels.
-- **Real tiny-model logits path** — The required `data/model.onnx` fixture compiles as one hybrid decoder layer with 192-wide hidden state, 1024-wide MLP intermediate state, 32k vocabulary logits, and grouped-query attention metadata.
+- **Real tiny-model logits path** — The local `data/model.onnx` fixture compiles as one hybrid decoder layer with 192-wide hidden state, 1024-wide MLP intermediate state, 32k vocabulary logits, and grouped-query attention metadata when ignored validation tests are run manually.
 - **Strict dialect verifier** — Rejects invalid tile sizes, out-of-bounds tiles, missing or duplicate orders, inconsistent schedules, bad scales, duplicate coverage, and offset mistakes while allowing padded edge tiles.
 - **Stable text IR** — `output.cim` has an MLIR-like textual form with parser/printer round-trip tests.
 - **MemTorch-oriented artifacts** — Emits `memtorch_manifest.json`, `memtorch_weights.bin`, optional `memtorch_digital.bin`, and an execution plan that records CiM versus digital placement.
 - **Narrow ONNX support** — Accepts the real tiny-model token-ID logits slice, bundled MHA-style projection fixtures, single rank-2 float projection initializers, and linear `MatMul`/`Gemm` nodes with initializer weights.
 - **Clear unsupported-op diagnostics** — Unsupported ONNX ops fail with the node name and supported-op list.
-- **Tested path** — `cargo test` covers the required real ONNX fixture and runs the MemTorch-backed token-ID-to-logits simulation.
+- **CI-safe tests** — `cargo test` uses generated/minimal ONNX fixtures, golden outputs, parser/verifier checks, CLI artifact checks, and clear unsupported-op diagnostics without requiring a large model download.
 
 ## Tech Stack
 
@@ -66,7 +66,7 @@ cim_compile/
 │   ├── cim.rs              ← Dialect parser/printer/verifier tests
 │   ├── cli.rs              ← End-to-end CLI artifact tests
 │   ├── golden.rs           ← Exact tiny-projection golden outputs
-│   ├── full.rs             ← Full test for data/model.onnx + MemTorch
+│   ├── full.rs             ← Ignored local validation for data/model.onnx + MemTorch
 │   └── generate_onnx_fixtures.py ← Runtime ONNX fixture generator
 ├── proto/                  ← Minimal ONNX protobuf schema
 ├── build.rs                ← Protobuf codegen setup
@@ -87,14 +87,14 @@ cargo build --release
 cargo test
 ```
 
-Python prerequisites for `cargo test`, full fixture generation, and `--run-memtorch`:
+Python prerequisites for tests, ignored real-model validation, and `--run-memtorch`:
 
-- Python 3 in `.venv` or another environment
-- PyTorch
+- Python 3 for the default pure-stdlib ONNX fixture generator
+- PyTorch for ignored real-model/MemTorch validation and Torch-exported fixtures
 - ONNX and `onnxscript` for Torch export
-- MemTorch CPU on this laptop, or CUDA MemTorch on a CUDA machine
+- MemTorch CPU on this laptop, or CUDA MemTorch on a CUDA machine, for `--run-memtorch`
 
-MemTorch is documented at [memtorch.readthedocs.io](https://memtorch.readthedocs.io/en/latest/). The Rust test suite requires `data/model.onnx` for the real tiny-model fixture, generates minimal ONNX protobuf fixtures with the Python standard library, and runs the MemTorch bridge through `.venv/bin/python` when present. `--run-memtorch` requires Torch and MemTorch.
+MemTorch is documented at [memtorch.readthedocs.io](https://memtorch.readthedocs.io/en/latest/). The default Rust test suite is CI-safe: it generates minimal ONNX protobuf fixtures with the Python standard library and does not require `data/model.onnx`. Ignored local validation tests can exercise a real model by setting `CIM_COMPILE_REAL_MODEL=/path/to/model.onnx`. `--run-memtorch` requires Torch and MemTorch.
 
 The local CPU simulation environment used for validation was installed with:
 
@@ -272,21 +272,22 @@ Float32 little-endian tensor payloads for digital fallback. The manifest records
 
 ## Testing & Validation
 
-Run the default suite:
+Run the default CI-safe suite:
 
 ```bash
 cargo test
 ```
 
-Coverage includes runtime-generated ONNX fixture ingestion, real-model tiny-decoder extraction, normalized lowering, bfloat16/f32 quantization, schedule generation, offset validation, `cim` parser/printer round trips, verifier failures, CLI success and failure cases, unavailable Python bridge diagnostics, MemTorch-backed token-logits and token-ID generation simulations, and exact golden outputs for a tiny projection.
+Coverage includes runtime-generated ONNX fixture ingestion, normalized lowering, bfloat16/f32 quantization, schedule generation, offset validation, `cim` parser/printer round trips, verifier failures, CLI success and failure cases, unavailable Python bridge diagnostics, and exact golden outputs for a tiny projection. It deliberately does not require `data/model.onnx` or download any model artifact.
 
-The full MemTorch test requires Torch, MemTorch, and `data/model.onnx`. In the local uv environment, it exercises the real ONNX fixture plus the checked-in MemTorch token-logits/generation bridge:
+Run ignored real-model checks manually when you have a local model:
 
 ```bash
-cargo test --test full
+CIM_COMPILE_REAL_MODEL=data/model.onnx cargo test -- --ignored
+CIM_COMPILE_REAL_MODEL=data/model.onnx cargo test --test full -- --ignored
 ```
 
-Note: https://huggingface.co/onnx-community/Tiny-LLM-ONNX/resolve/main/onnx/model.onnx is being used for testing.
+The full MemTorch test also requires Torch and MemTorch in the selected Python environment. The current local fixture came from https://huggingface.co/onnx-community/Tiny-LLM-ONNX/resolve/main/onnx/model.onnx, but large model files remain local/manual validation assets rather than CI inputs.
 
 ## Documentation Index
 

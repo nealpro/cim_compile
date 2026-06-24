@@ -21,6 +21,13 @@ fn repo_path(path: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
 }
 
+fn real_model_path() -> PathBuf {
+    if let Ok(path) = std::env::var("CIM_COMPILE_REAL_MODEL") {
+        return PathBuf::from(path);
+    }
+    repo_path("data/model.onnx")
+}
+
 fn test_python() -> String {
     if let Ok(python) = std::env::var("CIM_COMPILE_PYTHON") {
         return python;
@@ -34,11 +41,12 @@ fn test_python() -> String {
 }
 
 #[test]
+#[ignore = "requires a local real ONNX model and MemTorch; run with CIM_COMPILE_REAL_MODEL=/path/to/model.onnx cargo test --test full -- --ignored"]
 fn full_real_tiny_model_memtorch_token_logits_runs() {
-    let fixture = repo_path("data/model.onnx");
+    let fixture = real_model_path();
     assert!(
         fixture.exists(),
-        "required fixture is missing: {}",
+        "real-model fixture is missing: {}. Set CIM_COMPILE_REAL_MODEL=/path/to/model.onnx when running ignored full-model tests.",
         fixture.display()
     );
 
@@ -114,11 +122,12 @@ fn full_real_tiny_model_memtorch_token_logits_runs() {
 }
 
 #[test]
+#[ignore = "requires a local real ONNX model and MemTorch; run with CIM_COMPILE_REAL_MODEL=/path/to/model.onnx cargo test --test full -- --ignored"]
 fn full_real_tiny_model_memtorch_token_generation_runs() {
-    let fixture = repo_path("data/model.onnx");
+    let fixture = real_model_path();
     assert!(
         fixture.exists(),
-        "required fixture is missing: {}",
+        "real-model fixture is missing: {}. Set CIM_COMPILE_REAL_MODEL=/path/to/model.onnx when running ignored full-model tests.",
         fixture.display()
     );
 

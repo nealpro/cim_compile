@@ -59,6 +59,9 @@ fn generated_fixture_path(file_name: &str) -> PathBuf {
 }
 
 fn required_data_model_path() -> PathBuf {
+    if let Ok(path) = std::env::var("CIM_COMPILE_REAL_MODEL") {
+        return PathBuf::from(path);
+    }
     repo_path("data/model.onnx")
 }
 
@@ -221,11 +224,12 @@ fn cli_compiles_non_divisible_tile_size_with_padding() {
 }
 
 #[test]
+#[ignore = "requires a local real ONNX model; run with CIM_COMPILE_REAL_MODEL=/path/to/model.onnx cargo test -- --ignored"]
 fn cli_compiles_required_real_tiny_model_token_logits_slice() {
     let fixture = required_data_model_path();
     assert!(
         fixture.exists(),
-        "required fixture is missing: {}",
+        "real-model fixture is missing: {}. Set CIM_COMPILE_REAL_MODEL=/path/to/model.onnx when running ignored full-model tests.",
         fixture.display()
     );
     let out_dir = run_model_with_args(fixture.to_str().unwrap(), &["--tile-size", "128"]);

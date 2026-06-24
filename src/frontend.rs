@@ -1250,6 +1250,9 @@ mod tests {
     }
 
     fn required_data_model_path() -> std::path::PathBuf {
+        if let Ok(path) = std::env::var("CIM_COMPILE_REAL_MODEL") {
+            return Path::new(&path).to_path_buf();
+        }
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("data")
             .join("model.onnx")
@@ -1335,11 +1338,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a local real ONNX model; run with CIM_COMPILE_REAL_MODEL=/path/to/model.onnx cargo test -- --ignored"]
     fn extracts_real_tiny_model_token_logits_slice() {
         let path = required_data_model_path();
         assert!(
             path.exists(),
-            "required fixture is missing: {}",
+            "real-model fixture is missing: {}. Set CIM_COMPILE_REAL_MODEL=/path/to/model.onnx when running ignored full-model tests.",
             path.display()
         );
         let program = load_onnx_program(path).unwrap();
