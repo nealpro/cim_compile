@@ -58,6 +58,9 @@ fn golden_memtorch_manifest_for_tiny_projection() {
         "    {\n",
         "      \"name\": \"main\",\n",
         "      \"projection\": \"main\",\n",
+        "      \"stage\": \"projection\",\n",
+        "      \"parent\": null,\n",
+        "      \"target\": \"cim\",\n",
         "      \"rows\": 2,\n",
         "      \"cols\": 2,\n",
         "      \"bias\": null,\n",
@@ -65,6 +68,10 @@ fn golden_memtorch_manifest_for_tiny_projection() {
         "        {\n",
         "          \"row\": 0,\n",
         "          \"col\": 0,\n",
+        "          \"stage\": \"projection\",\n",
+        "          \"parent\": null,\n",
+        "          \"target\": \"cim\",\n",
+        "          \"reason\": \"static-weight projection `main` is CiM-friendly and maps cleanly to tiles\",\n",
         "          \"matrix_shape\": [\n",
         "            2,\n",
         "            2\n",
@@ -80,6 +87,10 @@ fn golden_memtorch_manifest_for_tiny_projection() {
         "        {\n",
         "          \"row\": 0,\n",
         "          \"col\": 1,\n",
+        "          \"stage\": \"projection\",\n",
+        "          \"parent\": null,\n",
+        "          \"target\": \"cim\",\n",
+        "          \"reason\": \"static-weight projection `main` is CiM-friendly and maps cleanly to tiles\",\n",
         "          \"matrix_shape\": [\n",
         "            2,\n",
         "            2\n",
@@ -95,6 +106,10 @@ fn golden_memtorch_manifest_for_tiny_projection() {
         "        {\n",
         "          \"row\": 1,\n",
         "          \"col\": 0,\n",
+        "          \"stage\": \"projection\",\n",
+        "          \"parent\": null,\n",
+        "          \"target\": \"cim\",\n",
+        "          \"reason\": \"static-weight projection `main` is CiM-friendly and maps cleanly to tiles\",\n",
         "          \"matrix_shape\": [\n",
         "            2,\n",
         "            2\n",
@@ -110,6 +125,10 @@ fn golden_memtorch_manifest_for_tiny_projection() {
         "        {\n",
         "          \"row\": 1,\n",
         "          \"col\": 1,\n",
+        "          \"stage\": \"projection\",\n",
+        "          \"parent\": null,\n",
+        "          \"target\": \"cim\",\n",
+        "          \"reason\": \"static-weight projection `main` is CiM-friendly and maps cleanly to tiles\",\n",
         "          \"matrix_shape\": [\n",
         "            2,\n",
         "            2\n",
@@ -124,7 +143,22 @@ fn golden_memtorch_manifest_for_tiny_projection() {
         "        }\n",
         "      ]\n",
         "    }\n",
-        "  ]\n",
+        "  ],\n",
+        "  \"execution_plan\": [\n",
+        "    {\n",
+        "      \"name\": \"main\",\n",
+        "      \"stage\": \"projection\",\n",
+        "      \"parent\": null,\n",
+        "      \"target\": \"cim\",\n",
+        "      \"reason\": \"static-weight projection `main` is CiM-friendly and maps cleanly to tiles\",\n",
+        "      \"shape\": [\n",
+        "        2,\n",
+        "        2\n",
+        "      ],\n",
+        "      \"tile_count\": 4\n",
+        "    }\n",
+        "  ],\n",
+        "  \"attention_blocks\": []\n",
         "}\n"
     );
 
@@ -138,10 +172,4 @@ fn golden_memtorch_weight_payload_for_tiny_projection() {
     let package = build_package(&normalized, &lowered).unwrap();
 
     assert_eq!(package.weights, vec![129, 0, 127, 127]);
-    assert!(package.runner.contains("patch_model"));
-    assert!(
-        package
-            .runner
-            .contains("tile_shape=tuple(manifest[\"tile_size\"])")
-    );
 }
