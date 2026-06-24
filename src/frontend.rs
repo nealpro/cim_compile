@@ -5,13 +5,18 @@ use std::path::Path;
 use prost::Message;
 
 use crate::cim::ProjectionKind;
-use crate::ir::{NormalizedOp, NormalizedProgram, ProjectionOp};
+use crate::ir::{
+    AttentionBlock, AttentionKernel, AttentionSliceMetadata, AttentionStage, DigitalTensor,
+    NormalizedOp, NormalizedProgram, ProjectionOp, TinyDecoderBlock, TinyDecoderMetadata,
+};
 
 mod onnx_proto {
     include!(concat!(env!("OUT_DIR"), "/onnx.rs"));
 }
 
 const FLOAT_DTYPE: i32 = 1;
+const INT32_DTYPE: i32 = 6;
+const INT64_DTYPE: i32 = 7;
 const FLOAT16_DTYPE: i32 = 10;
 const BF16_DTYPE: i32 = 16;
 
@@ -29,6 +34,7 @@ struct Node {
     name: String,
     op_type: String,
     input: Vec<String>,
+    output: Vec<String>,
     attribute: Vec<onnx_proto::AttributeProto>,
 }
 
@@ -71,6 +77,7 @@ pub fn load_onnx_program<P: AsRef<Path>>(onnx_path: P) -> Result<NormalizedProgr
             },
             op_type: node.op_type,
             input: node.input,
+            output: node.output,
             attribute: node.attribute,
         })
         .collect::<Vec<_>>();
@@ -95,8 +102,64 @@ fn normalize_graph(
         .iter()
         .map(|tensor| (tensor.name.clone(), tensor))
         .collect::<BTreeMap<_, _>>();
-    let mut ops = Vec::new();
+    if let Some(block) = build_tiny_decoder_block(&graph_name, nodes, &tensor_by_name)? {
+        return Ok(NormalizedProgram::new(
+            graph_name,
+            vec![NormalizedOp::TinyDecoder(block)],
+        ));
+    }
 
+    if let Some(block) = build_named_self_attention_block(&graph_name, nodes, &tensor_by_name)? {
+        return Ok(NormalizedProgram::new(
+            graph_name,
+            vec![NormalizedOp::Attention(block)],
+        ));
+    }
+
+    let attention_projections = projections_from_initializers(tensors).ok();
+    let is_attention_candidate = attention_projections
+        .as_ref()
+        .is_some_and(|projections| projections.len() == 4)
+        && nodes.iter().any(|node| node.op_type == "Softmax");
+
+    if is_attention_candidate {
+        let mut ops = Vec::new();
+        let block = build_attention_block(
+            graph_name.clone(),
+            nodes,
+            attention_projections.expect("attention candidate must have projections"),
+        )?;
+        ops.push(NormalizedOp::Attention(block));
+
+        for node in nodes {
+            match node.op_type.as_str() {
+                "MatMul" | "Gemm" | "Softmax" => {}
+                "Reshape" | "Flatten" | "Squeeze" | "Unsqueeze" | "Identity" | "Shape"
+                | "Gather" | "Concat" | "Constant" | "Split" | "Slice" | "Cast" | "Expand"
+                | "Mul" | "Div" | "Add" | "Sub" => {
+                    ops.push(NormalizedOp::Reshape {
+                        name: node.name.clone(),
+                    });
+                }
+                "Transpose" => {
+                    ops.push(NormalizedOp::Transpose {
+                        name: node.name.clone(),
+                        perm: ints_attr(node, "perm").unwrap_or_default(),
+                    });
+                }
+                other => {
+                    return Err(format!(
+                        "unsupported ONNX op `{other}` in node `{}`; supported ops are MatMul, Gemm, Reshape, Transpose, Flatten, Squeeze, Unsqueeze, Identity, Add, Sub, Mul, Div, Softmax, and attention-style projection graphs",
+                        node.name
+                    ));
+                }
+            }
+        }
+
+        return Ok(NormalizedProgram::new(graph_name, ops));
+    }
+
+    let mut ops = Vec::new();
     if !nodes.is_empty() {
         let mut projection_index = 0usize;
         for node in nodes {
@@ -175,6 +238,546 @@ fn normalize_graph(
             .into_iter()
             .map(NormalizedOp::Projection)
             .collect::<Vec<_>>(),
+    ))
+}
+
+fn build_tiny_decoder_block(
+    graph_name: &str,
+    nodes: &[Node],
+    tensors: &BTreeMap<String, &TensorBlob>,
+) -> Result<Option<TinyDecoderBlock>, String> {
+    let Some(attention) = build_named_self_attention_block(graph_name, nodes, tensors)? else {
+        return Ok(None);
+    };
+    let Some(attention_metadata) = attention.metadata.as_ref() else {
+        return Ok(None);
+    };
+    let source_prefix = attention_metadata.source_prefix.clone();
+    let Some(gate_node) = find_named_projection_node(nodes, &source_prefix, "mlp", "gate_proj")
+    else {
+        return Ok(None);
+    };
+    let up_node = find_named_projection_node(nodes, &source_prefix, "mlp", "up_proj")
+        .ok_or_else(|| "tiny decoder slice is missing mlp up_proj MatMul".to_string())?;
+    let down_node = find_named_projection_node(nodes, &source_prefix, "mlp", "down_proj")
+        .ok_or_else(|| "tiny decoder slice is missing mlp down_proj MatMul".to_string())?;
+
+    let gate_proj = projection_from_rhs_initializer_matmul(
+        gate_node,
+        tensors,
+        ProjectionKind::Named("mlp0_gate".to_string()),
+        "MLP gate projection",
+    )?;
+    let up_proj = projection_from_rhs_initializer_matmul(
+        up_node,
+        tensors,
+        ProjectionKind::Named("mlp1_up".to_string()),
+        "MLP up projection",
+    )?;
+    let down_proj = projection_from_rhs_initializer_matmul(
+        down_node,
+        tensors,
+        ProjectionKind::Named("mlp2_down".to_string()),
+        "MLP down projection",
+    )?;
+
+    if gate_proj.cols != attention_metadata.hidden_size
+        || up_proj.cols != attention_metadata.hidden_size
+    {
+        return Err(format!(
+            "tiny decoder MLP gate/up input dims must match hidden size {}; got gate={} up={}",
+            attention_metadata.hidden_size, gate_proj.cols, up_proj.cols
+        ));
+    }
+    if gate_proj.rows != up_proj.rows || down_proj.cols != gate_proj.rows {
+        return Err(format!(
+            "tiny decoder MLP dimensions are inconsistent: gate={}x{}, up={}x{}, down={}x{}",
+            gate_proj.rows,
+            gate_proj.cols,
+            up_proj.rows,
+            up_proj.cols,
+            down_proj.rows,
+            down_proj.cols
+        ));
+    }
+    if down_proj.rows != attention_metadata.hidden_size {
+        return Err(format!(
+            "tiny decoder MLP down projection output dim {} must match hidden size {}",
+            down_proj.rows, attention_metadata.hidden_size
+        ));
+    }
+
+    let embedding =
+        digital_tensor_from_initializer(tensors, "model.embed_tokens.weight", "token_embedding")?;
+    let input_norm = digital_tensor_from_initializer(
+        tensors,
+        "model.layers.0.input_layernorm.weight",
+        "input_layernorm_weight",
+    )?;
+    let post_attention_norm = digital_tensor_from_initializer(
+        tensors,
+        "model.layers.0.post_attention_layernorm.weight",
+        "post_attention_layernorm_weight",
+    )?;
+    let final_norm =
+        digital_tensor_from_initializer(tensors, "model.norm.weight", "final_norm_weight")?;
+    let lm_head = digital_tensor_from_initializer(tensors, "onnx::MatMul_481", "lm_head_weight")?;
+
+    let vocab_size = *embedding
+        .shape
+        .first()
+        .ok_or_else(|| "embedding tensor is missing vocab dimension".to_string())?;
+    let embedding_hidden = *embedding
+        .shape
+        .get(1)
+        .ok_or_else(|| "embedding tensor is missing hidden dimension".to_string())?;
+    if embedding_hidden != attention_metadata.hidden_size {
+        return Err(format!(
+            "embedding hidden size {} must match attention hidden size {}",
+            embedding_hidden, attention_metadata.hidden_size
+        ));
+    }
+    if lm_head.shape.as_slice() != [attention_metadata.hidden_size, vocab_size] {
+        return Err(format!(
+            "lm_head shape {:?} must be [hidden={}, vocab={}]",
+            lm_head.shape, attention_metadata.hidden_size, vocab_size
+        ));
+    }
+
+    let metadata = TinyDecoderMetadata {
+        model_kind: "tiny_decoder_v1".to_string(),
+        inference_mode: "token_ids_to_logits".to_string(),
+        source_prefix: source_prefix.clone(),
+        decoder_layers: 1,
+        default_sequence_length: 4,
+        vocab_size,
+        hidden_size: attention_metadata.hidden_size,
+        intermediate_size: gate_proj.rows,
+        head_dim: attention_metadata.head_dim,
+        q_heads: attention_metadata.q_heads,
+        kv_heads: attention_metadata.kv_heads,
+        grouped_query_attention: attention_metadata.grouped_query_attention,
+    };
+
+    Ok(Some(TinyDecoderBlock::new(
+        "tiny_decoder_v1",
+        metadata,
+        attention,
+        gate_proj,
+        up_proj,
+        down_proj,
+        vec![
+            embedding,
+            input_norm,
+            post_attention_norm,
+            final_norm,
+            lm_head,
+        ],
+    )))
+}
+
+fn build_named_self_attention_block(
+    graph_name: &str,
+    nodes: &[Node],
+    tensors: &BTreeMap<String, &TensorBlob>,
+) -> Result<Option<AttentionBlock>, String> {
+    let Some(q_node) = find_self_attention_projection_node(nodes, "q_proj") else {
+        return Ok(None);
+    };
+    let k_node = find_self_attention_projection_node(nodes, "k_proj")
+        .ok_or_else(|| "named self-attention slice is missing k_proj MatMul".to_string())?;
+    let v_node = find_self_attention_projection_node(nodes, "v_proj")
+        .ok_or_else(|| "named self-attention slice is missing v_proj MatMul".to_string())?;
+    let out_node = find_self_attention_projection_node(nodes, "o_proj")
+        .ok_or_else(|| "named self-attention slice is missing o_proj MatMul".to_string())?;
+
+    let q_index = node_index(nodes, q_node);
+    let softmax_index = nodes
+        .iter()
+        .position(|node| node.op_type == "Softmax" && node.name.contains("/self_attn/"))
+        .ok_or_else(|| "named self-attention slice is missing Softmax".to_string())?;
+    let score_index = nodes[..softmax_index]
+        .iter()
+        .rposition(|node| {
+            node.op_type == "MatMul"
+                && node.name.contains("/self_attn/")
+                && !node
+                    .input
+                    .get(1)
+                    .is_some_and(|name| tensors.contains_key(name))
+        })
+        .ok_or_else(|| "named self-attention slice is missing dynamic score MatMul".to_string())?;
+    let context_index = nodes[softmax_index + 1..]
+        .iter()
+        .position(|node| {
+            node.op_type == "MatMul"
+                && node.name.contains("/self_attn/")
+                && !node
+                    .input
+                    .get(1)
+                    .is_some_and(|name| tensors.contains_key(name))
+        })
+        .map(|relative| softmax_index + 1 + relative)
+        .ok_or_else(|| {
+            "named self-attention slice is missing dynamic context MatMul".to_string()
+        })?;
+
+    let q_proj = projection_from_attention_matmul(q_node, tensors, ProjectionKind::WQ)?;
+    let k_proj = projection_from_attention_matmul(k_node, tensors, ProjectionKind::WK)?;
+    let v_proj = projection_from_attention_matmul(v_node, tensors, ProjectionKind::WV)?;
+    let out_proj = projection_from_attention_matmul(out_node, tensors, ProjectionKind::WO)?;
+
+    if q_proj.cols != k_proj.cols || q_proj.cols != v_proj.cols {
+        return Err(format!(
+            "self-attention projections must share an input hidden size; got q={} k={} v={}",
+            q_proj.cols, k_proj.cols, v_proj.cols
+        ));
+    }
+    if k_proj.rows != v_proj.rows {
+        return Err(format!(
+            "self-attention k/v projections must share output size; got k={} v={}",
+            k_proj.rows, v_proj.rows
+        ));
+    }
+    if out_proj.cols != q_proj.rows {
+        return Err(format!(
+            "self-attention output projection input size {} must match q projection output size {}",
+            out_proj.cols, q_proj.rows
+        ));
+    }
+
+    let source_prefix =
+        self_attention_source_prefix(&q_node.name).unwrap_or_else(|| graph_name.to_string());
+    let block_name = if source_prefix.ends_with("/self_attn") {
+        source_prefix.clone()
+    } else {
+        format!("{source_prefix}/self_attn")
+    };
+    let head_dim = infer_head_dim(nodes, q_node, k_node).unwrap_or_else(|| {
+        if q_proj.rows.is_multiple_of(k_proj.rows) {
+            k_proj.rows
+        } else {
+            gcd(q_proj.rows, k_proj.rows)
+        }
+    });
+    let q_heads = checked_heads(q_proj.rows, head_dim, "q")?;
+    let kv_heads = checked_heads(k_proj.rows, head_dim, "kv")?;
+    let grouped_query_attention = q_heads != kv_heads;
+
+    let mut digital_fallbacks = Vec::new();
+    if grouped_query_attention {
+        digital_fallbacks.push(AttentionKernel::new(
+            format!("{block_name}/repeat_kv"),
+            AttentionStage::RepeatKv,
+            Some([q_heads, kv_heads]),
+        ));
+    }
+    if has_attention_mask_glue(&nodes[score_index..softmax_index]) {
+        digital_fallbacks.push(AttentionKernel::new(
+            format!("{block_name}/attention_mask"),
+            AttentionStage::AttentionMask,
+            None,
+        ));
+    }
+
+    let metadata = AttentionSliceMetadata {
+        source_prefix,
+        hidden_size: q_proj.cols,
+        q_dim: q_proj.rows,
+        kv_dim: k_proj.rows,
+        output_dim: out_proj.rows,
+        head_dim,
+        q_heads,
+        kv_heads,
+        grouped_query_attention,
+    };
+
+    let residual = nodes
+        .iter()
+        .skip(node_index(nodes, out_node))
+        .find(|node| node.op_type == "Add")
+        .map(|node| node.name.clone());
+
+    let block = AttentionBlock::new(
+        block_name,
+        q_proj,
+        k_proj,
+        v_proj,
+        AttentionKernel::new(
+            nodes[score_index].name.clone(),
+            AttentionStage::ScoreMatMul,
+            None,
+        ),
+        AttentionKernel::new(
+            nodes[softmax_index].name.clone(),
+            AttentionStage::Softmax,
+            None,
+        ),
+        AttentionKernel::new(
+            nodes[context_index].name.clone(),
+            AttentionStage::ContextMatMul,
+            None,
+        ),
+        out_proj,
+        residual,
+    )
+    .with_metadata(metadata)
+    .with_digital_fallbacks(digital_fallbacks);
+
+    if q_index > softmax_index {
+        return Err("self-attention q projection appears after Softmax".to_string());
+    }
+
+    Ok(Some(block))
+}
+
+fn find_self_attention_projection_node<'a>(
+    nodes: &'a [Node],
+    projection: &str,
+) -> Option<&'a Node> {
+    let marker = format!("/self_attn/{projection}/");
+    nodes.iter().find(|node| {
+        node.op_type == "MatMul" && node.name.contains(&marker) && node.input.len() >= 2
+    })
+}
+
+fn find_named_projection_node<'a>(
+    nodes: &'a [Node],
+    source_prefix: &str,
+    block: &str,
+    projection: &str,
+) -> Option<&'a Node> {
+    let marker = format!("{source_prefix}/{block}/{projection}/");
+    nodes.iter().find(|node| {
+        node.op_type == "MatMul" && node.name.contains(&marker) && node.input.len() >= 2
+    })
+}
+
+fn projection_from_attention_matmul(
+    node: &Node,
+    tensors: &BTreeMap<String, &TensorBlob>,
+    kind: ProjectionKind,
+) -> Result<ProjectionOp, String> {
+    projection_from_rhs_initializer_matmul(node, tensors, kind, "attention projection")
+}
+
+fn projection_from_rhs_initializer_matmul(
+    node: &Node,
+    tensors: &BTreeMap<String, &TensorBlob>,
+    kind: ProjectionKind,
+    context: &str,
+) -> Result<ProjectionOp, String> {
+    if node.input.len() < 2 {
+        return Err(format!("MatMul node `{}` must have two inputs", node.name));
+    }
+    let rhs = tensors.get(&node.input[1]).ok_or_else(|| {
+        format!(
+            "MatMul node `{}` is supported as a {context} only when its RHS input is an initializer",
+            node.name,
+        )
+    })?;
+    let (rows, cols, values) = matrix_values(rhs)?;
+    let values = transpose(&values, rows, cols);
+    ProjectionOp::new(&node.name, kind, cols, rows, values, None)
+}
+
+fn digital_tensor_from_initializer(
+    tensors: &BTreeMap<String, &TensorBlob>,
+    name: &str,
+    role: &str,
+) -> Result<DigitalTensor, String> {
+    let tensor = tensors
+        .get(name)
+        .ok_or_else(|| format!("tiny decoder slice is missing initializer `{name}`"))?;
+    let shape = tensor_shape(tensor)?;
+    let values = tensor_values(tensor)?;
+    DigitalTensor::new(display_tensor_name(tensor), role, shape, values)
+}
+
+fn self_attention_source_prefix(name: &str) -> Option<String> {
+    name.split_once("/self_attn/")
+        .map(|(prefix, _)| prefix.to_string())
+}
+
+fn node_index(nodes: &[Node], needle: &Node) -> usize {
+    nodes
+        .iter()
+        .position(|node| std::ptr::eq(node, needle))
+        .expect("node reference came from nodes")
+}
+
+fn checked_heads(dim: u32, head_dim: u32, label: &str) -> Result<u32, String> {
+    if head_dim == 0 || !dim.is_multiple_of(head_dim) {
+        return Err(format!(
+            "cannot infer {label} head count from dim {dim} and head_dim {head_dim}"
+        ));
+    }
+    Ok(dim / head_dim)
+}
+
+fn infer_head_dim(nodes: &[Node], q_node: &Node, k_node: &Node) -> Option<u32> {
+    infer_head_dim_from_projection_reshape(nodes, q_node)
+        .or_else(|| infer_head_dim_from_projection_reshape(nodes, k_node))
+}
+
+fn infer_head_dim_from_projection_reshape(nodes: &[Node], projection_node: &Node) -> Option<u32> {
+    let constants = constant_int_outputs(nodes);
+    let projection_output = projection_node.output.first()?;
+    let reshape = nodes
+        .iter()
+        .find(|node| node.op_type == "Reshape" && node.input.first() == Some(projection_output))?;
+    let shape_input = reshape.input.get(1)?;
+    if let Some(values) = constants.get(shape_input)
+        && let Some(value) = values.iter().rev().find(|value| **value > 0)
+    {
+        return u32::try_from(*value).ok();
+    }
+
+    let concat = nodes.iter().find(|node| {
+        node.op_type == "Concat" && node.output.iter().any(|output| output == shape_input)
+    })?;
+    concat.input.iter().rev().find_map(|input| {
+        constants.get(input).and_then(|values| {
+            values
+                .iter()
+                .rev()
+                .find(|value| **value > 0)
+                .and_then(|value| u32::try_from(*value).ok())
+        })
+    })
+}
+
+fn constant_int_outputs(nodes: &[Node]) -> BTreeMap<String, Vec<i64>> {
+    let mut constants = BTreeMap::new();
+    for node in nodes {
+        if node.op_type != "Constant" {
+            continue;
+        }
+        let Some(output) = node.output.first() else {
+            continue;
+        };
+        let Some(values) = node
+            .attribute
+            .iter()
+            .find(|attr| attr.name == "value")
+            .and_then(|attr| attr.t.as_ref())
+            .and_then(tensor_int_values)
+        else {
+            continue;
+        };
+        constants.insert(output.clone(), values);
+    }
+    constants
+}
+
+fn tensor_int_values(tensor: &onnx_proto::TensorProto) -> Option<Vec<i64>> {
+    match tensor.data_type {
+        INT64_DTYPE => {
+            if tensor.raw_data.is_empty() {
+                None
+            } else {
+                Some(
+                    tensor
+                        .raw_data
+                        .chunks_exact(8)
+                        .map(|bytes| i64::from_le_bytes(bytes.try_into().expect("chunk length")))
+                        .collect(),
+                )
+            }
+        }
+        INT32_DTYPE => {
+            if !tensor.raw_data.is_empty() {
+                Some(
+                    tensor
+                        .raw_data
+                        .chunks_exact(4)
+                        .map(|bytes| {
+                            i32::from_le_bytes(bytes.try_into().expect("chunk length")) as i64
+                        })
+                        .collect(),
+                )
+            } else {
+                Some(
+                    tensor
+                        .int32_data
+                        .iter()
+                        .map(|value| *value as i64)
+                        .collect(),
+                )
+            }
+        }
+        _ => None,
+    }
+}
+
+fn has_attention_mask_glue(nodes: &[Node]) -> bool {
+    nodes.iter().any(|node| {
+        node.name.contains("/self_attn/") && matches!(node.op_type.as_str(), "Where" | "Add")
+    })
+}
+
+fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let next = a % b;
+        a = b;
+        b = next;
+    }
+    a.max(1)
+}
+
+fn build_attention_block(
+    graph_name: String,
+    nodes: &[Node],
+    projections: Vec<ProjectionOp>,
+) -> Result<AttentionBlock, String> {
+    let mut projection_map = BTreeMap::new();
+    for projection in projections {
+        projection_map.insert(projection.kind.clone(), projection);
+    }
+
+    let q_proj = projection_map
+        .remove(&ProjectionKind::WQ)
+        .ok_or_else(|| "attention graph is missing a q projection".to_string())?;
+    let k_proj = projection_map
+        .remove(&ProjectionKind::WK)
+        .ok_or_else(|| "attention graph is missing a k projection".to_string())?;
+    let v_proj = projection_map
+        .remove(&ProjectionKind::WV)
+        .ok_or_else(|| "attention graph is missing a v projection".to_string())?;
+    let out_proj = projection_map
+        .remove(&ProjectionKind::WO)
+        .ok_or_else(|| "attention graph is missing an out projection".to_string())?;
+
+    let score_matmul = AttentionKernel::new(
+        format!("{graph_name}_score_matmul"),
+        AttentionStage::ScoreMatMul,
+        None,
+    );
+    let softmax = AttentionKernel::new(
+        format!("{graph_name}_softmax"),
+        AttentionStage::Softmax,
+        None,
+    );
+    let context_matmul = AttentionKernel::new(
+        format!("{graph_name}_context_matmul"),
+        AttentionStage::ContextMatMul,
+        None,
+    );
+    let residual = nodes
+        .iter()
+        .find(|node| node.op_type == "Add")
+        .map(|node| node.name.clone());
+
+    Ok(AttentionBlock::new(
+        graph_name,
+        q_proj,
+        k_proj,
+        v_proj,
+        score_matmul,
+        softmax,
+        context_matmul,
+        out_proj,
+        residual,
     ))
 }
 
@@ -501,6 +1104,22 @@ fn dims2(tensor: &TensorBlob) -> Result<(u32, u32), String> {
     Ok((rows, cols))
 }
 
+fn tensor_shape(tensor: &TensorBlob) -> Result<Vec<u32>, String> {
+    tensor
+        .dims
+        .iter()
+        .map(|dim| {
+            u32::try_from(*dim).map_err(|_| {
+                format!(
+                    "initializer `{}` has invalid dimension {}",
+                    display_tensor_name(tensor),
+                    dim
+                )
+            })
+        })
+        .collect()
+}
+
 fn is_supported_float_dtype(dtype: i32) -> bool {
     matches!(dtype, FLOAT_DTYPE | FLOAT16_DTYPE | BF16_DTYPE)
 }
@@ -621,6 +1240,12 @@ mod tests {
         fixture_dir().join(name)
     }
 
+    fn required_data_model_path() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("data")
+            .join("model.onnx")
+    }
+
     fn fixture_dir() -> std::path::PathBuf {
         use std::process::Command;
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -672,7 +1297,8 @@ mod tests {
         let program = load_onnx_program(data_path("memristor_mha_unrolled.onnx")).unwrap();
 
         assert_eq!(program.projection_count(), 4);
-        let first = program.projections().next().unwrap();
+        let projections = program.projections();
+        let first = projections.first().unwrap();
         assert_eq!(first.kind, ProjectionKind::WQ);
         assert_eq!(first.rows, 512);
         assert_eq!(first.cols, 512);
@@ -684,6 +1310,7 @@ mod tests {
         let program = load_onnx_program(data_path("mha_bfloat16.onnx")).unwrap();
         let kinds = program
             .projections()
+            .into_iter()
             .map(|projection| projection.kind.clone())
             .collect::<Vec<_>>();
 
@@ -695,6 +1322,80 @@ mod tests {
                 ProjectionKind::WV,
                 ProjectionKind::WO
             ]
+        );
+    }
+
+    #[test]
+    fn extracts_real_tiny_model_token_logits_slice() {
+        let path = required_data_model_path();
+        assert!(
+            path.exists(),
+            "required fixture is missing: {}",
+            path.display()
+        );
+        let program = load_onnx_program(path).unwrap();
+
+        assert_eq!(program.ops.len(), 1);
+        let NormalizedOp::TinyDecoder(decoder) = &program.ops[0] else {
+            panic!("expected real model to normalize as one tiny decoder block");
+        };
+        let block = &decoder.attention;
+        assert_eq!(block.name, "/model/layers.0/self_attn");
+        assert_eq!(block.q_proj.rows, 192);
+        assert_eq!(block.q_proj.cols, 192);
+        assert_eq!(block.k_proj.rows, 96);
+        assert_eq!(block.k_proj.cols, 192);
+        assert_eq!(block.v_proj.rows, 96);
+        assert_eq!(block.v_proj.cols, 192);
+        assert_eq!(block.out_proj.rows, 192);
+        assert_eq!(block.out_proj.cols, 192);
+
+        let metadata = block.metadata.as_ref().expect("missing attention metadata");
+        assert_eq!(metadata.hidden_size, 192);
+        assert_eq!(metadata.q_dim, 192);
+        assert_eq!(metadata.kv_dim, 96);
+        assert_eq!(metadata.output_dim, 192);
+        assert_eq!(metadata.head_dim, 96);
+        assert_eq!(metadata.q_heads, 2);
+        assert_eq!(metadata.kv_heads, 1);
+        assert!(metadata.grouped_query_attention);
+        assert!(
+            block
+                .kernel_entries()
+                .iter()
+                .any(|kernel| kernel.stage == AttentionStage::RepeatKv)
+        );
+        assert!(
+            block
+                .kernel_entries()
+                .iter()
+                .any(|kernel| kernel.stage == AttentionStage::AttentionMask)
+        );
+
+        assert_eq!(decoder.metadata.model_kind, "tiny_decoder_v1");
+        assert_eq!(decoder.metadata.inference_mode, "token_ids_to_logits");
+        assert_eq!(decoder.metadata.vocab_size, 32000);
+        assert_eq!(decoder.metadata.hidden_size, 192);
+        assert_eq!(decoder.metadata.intermediate_size, 1024);
+        assert_eq!(decoder.metadata.decoder_layers, 1);
+        assert_eq!(decoder.mlp_gate_proj.rows, 1024);
+        assert_eq!(decoder.mlp_gate_proj.cols, 192);
+        assert_eq!(decoder.mlp_up_proj.rows, 1024);
+        assert_eq!(decoder.mlp_up_proj.cols, 192);
+        assert_eq!(decoder.mlp_down_proj.rows, 192);
+        assert_eq!(decoder.mlp_down_proj.cols, 1024);
+        assert_eq!(decoder.digital_tensors.len(), 5);
+        assert!(
+            decoder
+                .digital_tensors
+                .iter()
+                .any(|tensor| tensor.role == "token_embedding" && tensor.shape == [32000, 192])
+        );
+        assert!(
+            decoder
+                .digital_tensors
+                .iter()
+                .any(|tensor| tensor.role == "lm_head_weight" && tensor.shape == [192, 32000])
         );
     }
 }
