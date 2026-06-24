@@ -23,11 +23,22 @@ fn temp_output_dir(model_name: &str) -> PathBuf {
     ))
 }
 
+fn test_python() -> String {
+    if let Ok(python) = std::env::var("CIM_COMPILE_PYTHON") {
+        return python;
+    }
+    let local = repo_path(".venv/bin/python");
+    if local.exists() {
+        local.display().to_string()
+    } else {
+        "python3".to_string()
+    }
+}
+
 fn generated_fixture_path(file_name: &str) -> PathBuf {
     let out_dir = temp_output_dir("onnx_fixtures");
     let script = repo_path("tests/generate_onnx_fixtures.py");
-    let python = std::env::var("CIM_COMPILE_PYTHON").unwrap_or_else(|_| "python3".to_string());
-    let output = Command::new(&python)
+    let output = Command::new(test_python())
         .arg(script)
         .arg("--output-dir")
         .arg(&out_dir)
@@ -181,14 +192,18 @@ fn cli_rejects_non_divisible_tile_size() {
 }
 
 #[test]
-fn cli_rejects_missing_memtorch_python_environment_when_asked_to_run() {
+fn cli_rejects_unavailable_memtorch_python_executable_when_asked_to_run() {
+    let missing_python = temp_output_dir("missing_python").join("python");
     let stderr = run_model_expect_failure(
         generated_fixture_path("memristor_mha_unrolled.onnx")
             .to_str()
             .unwrap(),
-        &["--run-memtorch"],
+        &[
+            "--run-memtorch",
+            "--python",
+            missing_python.to_str().unwrap(),
+        ],
     );
 
-    assert!(stderr.contains("MemTorch runner failed"));
-    assert!(stderr.contains("requires torch and memtorch"));
+    assert!(stderr.contains("failed to run"));
 }

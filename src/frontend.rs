@@ -637,8 +637,7 @@ mod tests {
         let script = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("generate_onnx_fixtures.py");
-        let python = std::env::var("CIM_COMPILE_PYTHON").unwrap_or_else(|_| "python3".to_string());
-        let output = Command::new(&python)
+        let output = Command::new(test_python())
             .arg(&script)
             .arg("--output-dir")
             .arg(&out_dir)
@@ -651,6 +650,21 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         out_dir
+    }
+
+    fn test_python() -> String {
+        if let Ok(python) = std::env::var("CIM_COMPILE_PYTHON") {
+            return python;
+        }
+        let local = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".venv")
+            .join("bin")
+            .join("python");
+        if local.exists() {
+            local.display().to_string()
+        } else {
+            "python3".to_string()
+        }
     }
 
     #[test]

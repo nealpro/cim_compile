@@ -30,8 +30,8 @@ struct Cli {
     run_memtorch: bool,
 
     /// Python executable to use with --run-memtorch
-    #[arg(long, default_value = "python3")]
-    python: String,
+    #[arg(long)]
+    python: Option<String>,
 }
 
 fn main() {
@@ -82,12 +82,13 @@ fn run() -> Result<(), String> {
     );
 
     if cli.run_memtorch {
-        let output = Command::new(&cli.python)
+        let python = cli.python.clone().unwrap_or_else(default_python);
+        let output = Command::new(&python)
             .arg(&runner_path)
             .arg("--manifest")
             .arg(&manifest_path)
             .output()
-            .map_err(|err| format!("failed to run {}: {err}", cli.python))?;
+            .map_err(|err| format!("failed to run {python}: {err}"))?;
         if !output.status.success() {
             return Err(format!(
                 "MemTorch runner failed\nstdout:\n{}\nstderr:\n{}",
@@ -99,4 +100,13 @@ fn run() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn default_python() -> String {
+    let local_venv = PathBuf::from(".venv").join("bin").join("python");
+    if local_venv.exists() {
+        local_venv.display().to_string()
+    } else {
+        "python3".to_string()
+    }
 }

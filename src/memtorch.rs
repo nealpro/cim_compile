@@ -113,12 +113,21 @@ fn runner_script() -> String {
 import argparse
 import copy
 import json
+import os
 import struct
 from pathlib import Path
 
 
 def _safe_key(name):
     return "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in name)
+
+
+def _configure_local_caches(anchor):
+    cache_root = anchor / ".cim_compile_cache"
+    os.environ.setdefault("MPLCONFIGDIR", str(cache_root / "matplotlib"))
+    os.environ.setdefault("XDG_CACHE_HOME", str(cache_root / "xdg"))
+    Path(os.environ["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
+    Path(os.environ["XDG_CACHE_HOME"]).mkdir(parents=True, exist_ok=True)
 
 
 def _load_tile(raw, tile):
@@ -214,6 +223,7 @@ def main():
     args = parser.parse_args()
 
     manifest_path = Path(args.manifest)
+    _configure_local_caches(manifest_path.parent)
     manifest = json.loads(manifest_path.read_text())
     weights_path = Path(args.weights) if args.weights else manifest_path.with_name(manifest["weights_file"])
     raw_weights = weights_path.read_bytes()

@@ -19,6 +19,18 @@ fn repo_path(path: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
 }
 
+fn test_python() -> String {
+    if let Ok(python) = std::env::var("CIM_COMPILE_PYTHON") {
+        return python;
+    }
+    let local = repo_path(".venv/bin/python");
+    if local.exists() {
+        local.display().to_string()
+    } else {
+        "python3".to_string()
+    }
+}
+
 #[test]
 #[ignore = "requires torch+onnx; run with CIM_COMPILE_FULL_TESTS=1 cargo test --test full -- --ignored"]
 fn full_torch_export_fixture_compiles() {
@@ -28,8 +40,7 @@ fn full_torch_export_fixture_compiles() {
     }
 
     let fixture_dir = temp_dir("fixtures");
-    let python = std::env::var("CIM_COMPILE_PYTHON").unwrap_or_else(|_| "python3".to_string());
-    let generator = Command::new(&python)
+    let generator = Command::new(test_python())
         .arg(repo_path("tests/generate_onnx_fixtures.py"))
         .arg("--mode")
         .arg("all")
@@ -55,6 +66,9 @@ fn full_torch_export_fixture_compiles() {
         .arg(&out_dir)
         .arg("--tile-size")
         .arg("64")
+        .arg("--run-memtorch")
+        .arg("--python")
+        .arg(test_python())
         .output()
         .expect("failed to run cim_compile");
     assert!(
@@ -65,4 +79,6 @@ fn full_torch_export_fixture_compiles() {
     );
     assert!(out_dir.join("output.cim").exists());
     assert!(out_dir.join("memtorch_manifest.json").exists());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"results\""));
 }

@@ -7,7 +7,7 @@
 
 ## TL;DR
 
-`cim_compile` is a small local compiler that turns a supported ONNX model into a verified compute-in-memory simulation package. It reads projection-style weights, lowers them into a strict `cim` dialect, and emits the files needed to run those tiles through MemTorch on a normal laptop. The project intentionally supports a narrow slice first, so failures are explicit and the compiler can be tested deeply instead of pretending to handle every ONNX graph.
+`cim_compile` is a small local compiler that turns a supported ONNX model into a verified compute-in-memory simulation package. It reads projection-style weights, lowers them into a strict `cim` dialect, and emits the files needed to run those tiles through MemTorch on a normal laptop. On this MacBook Air, the CPU MemTorch path has been installed and validated for the supported fixture path; CUDA validation belongs on a CUDA machine. The project intentionally supports a narrow slice first, so failures are explicit and the compiler can be tested deeply instead of pretending to handle every ONNX graph.
 
 ## Overview
 
@@ -31,7 +31,7 @@ Memristive compute-in-memory systems represent matrix weights as device conducta
 - **MemTorch-oriented artifacts** — Emits `memtorch_manifest.json`, `memtorch_weights.bin`, and `run_memtorch.py`.
 - **Narrow ONNX support** — Accepts the bundled MHA-style projection fixtures, single rank-2 float projection initializers, and linear `MatMul`/`Gemm` nodes with initializer weights.
 - **Clear unsupported-op diagnostics** — Unsupported ONNX ops fail with the node name and supported-op list.
-- **Tested path** — `cargo test` currently passes 30 / 30 tests across unit, dialect, CLI, and golden-output coverage.
+- **Tested path** — `cargo test` currently passes 30 / 30 default tests, and the opt-in Torch/ONNX/MemTorch full test passes 1 / 1 in the local uv environment.
 
 ## Tech Stack
 
@@ -43,7 +43,7 @@ Memristive compute-in-memory systems represent matrix weights as device conducta
 | ONNX protobuf ingestion | `prost` 0.14 |
 | Protobuf code generation | `prost-build` + `protoc-bin-vendored` |
 | Simulation target | MemTorch via generated Python + PyTorch model reconstruction |
-| Package manager | Cargo |
+| Package manager | Cargo; uv for optional Python simulation dependencies |
 
 ## Project Structure
 
@@ -84,12 +84,22 @@ cargo test
 
 Optional prerequisites for full fixture generation or actually running the generated MemTorch simulation:
 
-- Python 3
+- Python 3 in `.venv` or another environment
 - PyTorch
-- ONNX Python package for Torch export
-- MemTorch
+- ONNX and `onnxscript` for Torch export
+- MemTorch CPU on this laptop, or CUDA MemTorch on a CUDA machine
 
 MemTorch is documented at [memtorch.readthedocs.io](https://memtorch.readthedocs.io/en/latest/). The default Rust test suite generates minimal ONNX protobuf fixtures with the Python standard library and does not require Torch, ONNX, or MemTorch to be installed; full tests and `--run-memtorch` do.
+
+The local CPU simulation environment used for validation was installed with:
+
+```bash
+uv pip install torch onnx onnxscript
+uv pip install --no-deps --no-build-isolation memtorch-cpu
+uv pip install pandas scipy scikit-learn torchvision matplotlib seaborn ipython lmfit
+```
+
+That environment currently imports `torch 2.12.1`, `onnx 1.22.0`, `onnxscript 0.7.0`, and `memtorch 1.1.6-cpu`. `uv pip check` still reports MemTorch's historical `sklearn` package alias as missing; runtime uses `scikit-learn` and the full MemTorch test passes.
 
 ## Quick Start
 
@@ -124,7 +134,7 @@ If Python cannot import Torch and MemTorch, the command still writes the compile
 ## CLI / API Reference
 
 ```text
-cim_compile <ONNX_PATH> [OPTIONS]
+cim_compile [OPTIONS] <ONNX_PATH>
 
 Arguments:
   <ONNX_PATH>              Path to the ONNX model file
@@ -134,7 +144,7 @@ Options:
       --tile-size <N>      Square crossbar tile dimension [default: 128]
       --bits <N>           Quantization bit-width for tile payloads: 4 or 8 [default: 8]
       --run-memtorch       Run the generated MemTorch script after writing artifacts
-      --python <PYTHON>    Python executable to use with --run-memtorch [default: python3]
+      --python <PYTHON>    Python executable to use with --run-memtorch
   -h, --help               Print help
   -V, --version            Print version
 ```
@@ -178,7 +188,7 @@ There is no config file. The compiler is configured through CLI flags or `Compil
 | `--bits <N>` | Quantizes float weights to signed 4-bit or 8-bit ranges, stored as one byte per weight. |
 | `--output-dir <DIR>` | Writes generated artifacts into the selected directory. |
 | `--run-memtorch` | Runs the generated Python script after compiling. |
-| `--python <PYTHON>` | Selects the Python executable for `--run-memtorch`. |
+| `--python <PYTHON>` | Selects the Python executable for `--run-memtorch`; if omitted, the CLI uses `.venv/bin/python` when present, then falls back to `python3`. |
 
 ## Output Reference
 
@@ -215,15 +225,15 @@ Generated Python runner. It reconstructs PyTorch `Linear` layers from the manife
 
 ## Testing & Validation
 
-The current suite passes 30 / 30 tests:
+The default suite passes 30 / 30 tests:
 
 ```bash
 cargo test
 ```
 
-Coverage includes runtime-generated ONNX fixture ingestion, normalized lowering, bfloat16/f32 quantization, schedule generation, offset validation, `cim` parser/printer round trips, verifier failures, CLI success and failure cases, missing MemTorch environment diagnostics, and exact golden outputs for a tiny projection.
+Coverage includes runtime-generated ONNX fixture ingestion, normalized lowering, bfloat16/f32 quantization, schedule generation, offset validation, `cim` parser/printer round trips, verifier failures, CLI success and failure cases, unavailable Python runner diagnostics, and exact golden outputs for a tiny projection.
 
-Full fixture tests are opt-in because they require Torch and ONNX:
+Full fixture tests are opt-in because they require Torch, ONNX, and MemTorch. In the local uv environment, the full test passes 1 / 1 and exercises Torch-exported ONNX plus the generated MemTorch runner:
 
 ```bash
 CIM_COMPILE_FULL_TESTS=1 cargo test --test full -- --ignored
@@ -234,6 +244,7 @@ CIM_COMPILE_FULL_TESTS=1 cargo test --test full -- --ignored
 | Document | Contents |
 |---|---|
 | [LINKS.md](LINKS.md) | Reference links for ONNX, MLIR-style IRs, MemTorch, CiM context, and compiler architecture. |
+| [NOTES.md](NOTES.md) | Current milestone state, design decisions, local Python environment, and test counts. |
 
 ## License
 
