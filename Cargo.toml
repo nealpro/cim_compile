@@ -3,7 +3,7 @@ name = "cim_compile"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
-description = "Toy MLIR-style CiM compiler that lowers ONNX projections to a MemTorch simulation path"
+description = "Rust CiM compiler that lowers ONNX transformer attention blocks into a MemTorch simulation path"
 license = "MIT"
 repository = "https://github.com/nealpro/cim_compile"
 

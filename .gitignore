@@ -1,4 +1,7 @@
 target/
 data/
+__pycache__/
+out/
+*.pyc
 *.bin
 *.s
