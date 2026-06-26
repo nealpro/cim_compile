@@ -4,6 +4,7 @@ import json
 import math
 import os
 import struct
+import sys
 from pathlib import Path
 
 
@@ -22,20 +23,22 @@ def _configure_local_caches(anchor):
 def _load_tile(raw, tile):
     rows, cols = tile["tile_size"]
     count = rows * cols
-    offset = tile["weight_offset"]
-    payload = raw[offset : offset + count]
-    if len(payload) != count:
-        raise ValueError(f"tile at offset {offset} has {len(payload)} bytes, expected {count}")
-    values = struct.unpack(f"{count}b", payload)
+    offset = int(tile["weight_offset"])
+    byte_len = int(tile.get("byte_len", count * 4))
+    expected = count * 4
+    if byte_len != expected:
+        raise ValueError(f"tile at offset {offset} has {byte_len} bytes, expected {expected}")
+    payload = raw[offset : offset + byte_len]
+    if len(payload) != byte_len:
+        raise ValueError(f"tile at offset {offset} has {len(payload)} bytes, expected {byte_len}")
+    values = struct.unpack(f"<{count}f", payload)
     try:
         import torch
     except ImportError as exc:
         raise SystemExit(
-            "MemTorch simulation requires torch and memtorch. Install them in this Python environment first."
+            "AIHWKIT simulation requires torch and aihwkit. Install them in this Python environment first."
         ) from exc
-    return torch.tensor(values, dtype=torch.float32).reshape(rows, cols) * float(
-        tile["quant_scale"]
-    )
+    return torch.tensor(values, dtype=torch.float32).reshape(rows, cols)
 
 
 def _load_digital_tensors(manifest, digital_path):
@@ -47,7 +50,7 @@ def _load_digital_tensors(manifest, digital_path):
         import torch
     except ImportError as exc:
         raise SystemExit(
-            "MemTorch simulation requires torch and memtorch. Install them in this Python environment first."
+            "AIHWKIT simulation requires torch and aihwkit. Install them in this Python environment first."
         ) from exc
 
     raw = digital_path.read_bytes()
@@ -74,9 +77,36 @@ def _load_digital_tensors(manifest, digital_path):
     return tensors
 
 
-def build_torch_model(manifest, raw_weights):
+def _build_rpu_config(manifest):
+    try:
+        from aihwkit.simulator.configs import TorchInferenceRPUConfig
+    except ImportError as exc:
+        raise SystemExit(
+            "AIHWKIT simulation requires torch and aihwkit. Install them in this Python environment first."
+        ) from exc
+
+    rpu_config = TorchInferenceRPUConfig()
+    config = manifest.get("rpu_config") or {}
+    mapping = rpu_config.mapping
+    mapping.max_input_size = int(config.get("max_input_size", manifest["tile_size"][1]))
+    mapping.max_output_size = int(config.get("max_output_size", manifest["tile_size"][0]))
+    mapping.digital_bias = bool(config.get("digital_bias", True))
+    if hasattr(rpu_config.forward, "is_perfect"):
+        rpu_config.forward.is_perfect = True
+    if hasattr(rpu_config, "drift_compensation"):
+        rpu_config.drift_compensation = None
+    return rpu_config
+
+
+def build_aihwkit_model(manifest, raw_weights):
     import torch
     import torch.nn as nn
+    try:
+        from aihwkit.nn import AnalogLinearMapped
+    except ImportError as exc:
+        raise SystemExit(
+            "AIHWKIT simulation requires torch and aihwkit. Install them in this Python environment first."
+        ) from exc
 
     class ProjectionBank(nn.Module):
         def __init__(self):
@@ -93,13 +123,15 @@ def build_torch_model(manifest, raw_weights):
             return y.reshape(*leading, y.shape[-1])
 
     model = ProjectionBank()
+    rpu_config = _build_rpu_config(manifest)
     for projection in manifest["projections"]:
         key = _safe_key(projection["name"])
         model.key_by_name[projection["name"]] = key
-        layer = nn.Linear(
+        layer = AnalogLinearMapped(
             projection["cols"],
             projection["rows"],
             bias=projection.get("bias") is not None,
+            rpu_config=copy.deepcopy(rpu_config),
         )
         full = torch.zeros((projection["rows"], projection["cols"]), dtype=torch.float32)
         for tile in projection["tiles"]:
@@ -109,42 +141,12 @@ def build_torch_model(manifest, raw_weights):
             row1 = min(row0 + tile["tile_size"][0], projection["rows"])
             col1 = min(col0 + tile["tile_size"][1], projection["cols"])
             full[row0:row1, col0:col1] = tile_tensor[: row1 - row0, : col1 - col0]
-        with torch.no_grad():
-            layer.weight.copy_(full)
-            if projection.get("bias") is not None:
-                layer.bias.copy_(torch.tensor(projection["bias"], dtype=torch.float32))
+        bias = None
+        if projection.get("bias") is not None:
+            bias = torch.tensor(projection["bias"], dtype=torch.float32)
+        layer.set_weights(full, bias)
         model.layers[key] = layer
     return model
-
-
-def patch_with_memtorch(model, manifest):
-    try:
-        import torch
-        import memtorch
-        from memtorch.bh.crossbar.Program import naive_program
-        from memtorch.map.Input import naive_scale
-        from memtorch.map.Parameter import naive_map
-        from memtorch.mn.Module import patch_model
-    except ImportError as exc:
-        raise SystemExit(
-            "MemTorch simulation requires torch and memtorch. Install them in this Python environment first."
-        ) from exc
-
-    return patch_model(
-        copy.deepcopy(model),
-        memristor_model=memtorch.bh.memristor.VTEAM,
-        memristor_model_params={},
-        module_parameters_to_patch=[torch.nn.Linear],
-        mapping_routine=naive_map,
-        transistor=True,
-        programming_routine=naive_program,
-        tile_shape=tuple(manifest["tile_size"]),
-        max_input_voltage=0.3,
-        scaling_routine=naive_scale,
-        ADC_resolution=8,
-        ADC_overflow_rate=0.0,
-        quant_method="linear",
-    )
 
 
 def _projection_by_stage(manifest, stage):
@@ -282,7 +284,7 @@ def _run_projection_smoke(sim_model, manifest, batch_size):
         import torch
     except ImportError as exc:
         raise SystemExit(
-            "MemTorch simulation requires torch and memtorch. Install them in this Python environment first."
+            "AIHWKIT simulation requires torch and aihwkit. Install them in this Python environment first."
         ) from exc
 
     results = {}
@@ -303,7 +305,7 @@ def run_attention_slice(sim_model, manifest, batch_size, seq_len):
         import torch
     except ImportError as exc:
         raise SystemExit(
-            "MemTorch simulation requires torch and memtorch. Install them in this Python environment first."
+            "AIHWKIT simulation requires torch and aihwkit. Install them in this Python environment first."
         ) from exc
 
     if not any(block.get("metadata") for block in manifest.get("attention_blocks", [])):
@@ -407,7 +409,7 @@ def run_token_logits(sim_model, manifest, digital_tensors, input_ids, top_k):
         import torch
     except ImportError as exc:
         raise SystemExit(
-            "MemTorch simulation requires torch and memtorch. Install them in this Python environment first."
+            "AIHWKIT simulation requires torch and aihwkit. Install them in this Python environment first."
         ) from exc
 
     if not manifest.get("inference_slice"):
@@ -429,11 +431,19 @@ def run_token_logits(sim_model, manifest, digital_tensors, input_ids, top_k):
     }
 
 
-def _cache_shapes(kv_cache):
+def _decoder_layers(manifest):
+    topology = manifest.get("model_topology") or {}
+    if "decoder_layers" in topology:
+        return int(topology["decoder_layers"])
+    inference = manifest.get("inference_slice") or {}
+    return int(inference.get("decoder_layers", 1))
+
+
+def _cache_shapes(manifest, kv_cache):
     if kv_cache is None:
         return None
     return {
-        "layers": 1,
+        "layers": _decoder_layers(manifest),
         "key": list(kv_cache["key"].shape),
         "value": list(kv_cache["value"].shape),
     }
@@ -452,7 +462,7 @@ def run_token_generation(
         import torch
     except ImportError as exc:
         raise SystemExit(
-            "MemTorch simulation requires torch and memtorch. Install them in this Python environment first."
+            "AIHWKIT simulation requires torch and aihwkit. Install them in this Python environment first."
         ) from exc
 
     if not manifest.get("inference_slice"):
@@ -501,7 +511,7 @@ def run_token_generation(
                     "input_ids": list(next_input),
                     "selected_token_id": next_token_id,
                     "topk": topk,
-                    "cache_shapes_after_step": _cache_shapes(kv_cache),
+                    "cache_shapes_after_step": _cache_shapes(manifest, kv_cache),
                     "attention": debug["attention"],
                 }
             )
@@ -529,29 +539,231 @@ def run_token_generation(
         "per_step_topk": per_step_topk,
         "stop_reason": stop_reason,
         "decode_steps": len(new_token_ids),
-        "cache_shapes": _cache_shapes(kv_cache),
+        "cache_shapes": _cache_shapes(manifest, kv_cache),
         "eos_token_id": eos_token_id,
     }
+
+
+def _load_manifest(manifest_path):
+    return json.loads(manifest_path.read_text())
+
+
+def _manifest_vocab_size(manifest):
+    topology = manifest.get("model_topology") or {}
+    if topology.get("vocab_size") is not None:
+        return int(topology["vocab_size"])
+    inference = manifest.get("inference_slice") or {}
+    if inference.get("vocab_size") is not None:
+        return int(inference["vocab_size"])
+    for tensor in manifest.get("digital_tensors", []):
+        if tensor.get("role") == "token_embedding":
+            shape = tensor.get("shape") or []
+            if shape:
+                return int(shape[0])
+    return None
+
+
+def _tokenizer_size(tokenizer):
+    base_vocab_size = getattr(tokenizer, "vocab_size", None)
+    try:
+        tokenizer_length = len(tokenizer)
+    except TypeError:
+        tokenizer_length = None
+    return (
+        int(base_vocab_size) if base_vocab_size is not None else None,
+        int(tokenizer_length) if tokenizer_length is not None else None,
+    )
+
+
+def _tokenizer_info(tokenizer, manifest):
+    base_vocab_size, tokenizer_length = _tokenizer_size(tokenizer)
+    return {
+        "class": tokenizer.__class__.__name__,
+        "name_or_path": getattr(tokenizer, "name_or_path", None),
+        "vocab_size": base_vocab_size,
+        "length": tokenizer_length,
+        "model_vocab_size": _manifest_vocab_size(manifest),
+        "local_files_only": True,
+    }
+
+
+def _validate_tokenizer_for_manifest(tokenizer, manifest, tokenizer_name):
+    model_vocab_size = _manifest_vocab_size(manifest)
+    if model_vocab_size is None:
+        return
+    base_vocab_size, tokenizer_length = _tokenizer_size(tokenizer)
+    if base_vocab_size == model_vocab_size or tokenizer_length == model_vocab_size:
+        return
+    raise SystemExit(
+        "tokenizer "
+        f"{tokenizer_name!r} is incompatible with manifest vocab_size {model_vocab_size}; "
+        f"tokenizer.vocab_size={base_vocab_size}, len(tokenizer)={tokenizer_length}"
+    )
+
+
+def _load_tokenizer(tokenizer_name, requested_by, manifest):
+    if not tokenizer_name:
+        raise SystemExit(f"{requested_by} requires --tokenizer")
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as exc:
+        raise SystemExit(
+            f"{requested_by} requires transformers. Install transformers or omit text-mode options."
+        ) from exc
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, local_files_only=True)
+    except Exception as exc:
+        raise SystemExit(
+            f"failed to load local tokenizer {tokenizer_name!r}: {exc}. "
+            "Text mode only uses local tokenizer files or an already cached tokenizer. "
+            "If this tokenizer needs SentencePiece, install the sentencepiece package."
+        ) from exc
+    _validate_tokenizer_for_manifest(tokenizer, manifest, tokenizer_name)
+    return tokenizer
+
+
+def _validate_token_ids(token_ids, vocab_size, context):
+    if vocab_size is None:
+        return
+    invalid = [
+        int(token_id)
+        for token_id in token_ids
+        if int(token_id) < 0 or int(token_id) >= int(vocab_size)
+    ]
+    if invalid:
+        preview = invalid[:8]
+        suffix = "" if len(invalid) <= len(preview) else f" and {len(invalid) - len(preview)} more"
+        raise ValueError(
+            f"{context} produced token IDs outside manifest vocab_size {vocab_size}: "
+            f"{preview}{suffix}"
+        )
+
+
+def _encode_prompt_text(tokenizer, prompt_text, manifest):
+    token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+    if not token_ids:
+        raise ValueError("--prompt-text encoded to zero token IDs")
+    token_ids = [int(token_id) for token_id in token_ids]
+    _validate_token_ids(token_ids, _manifest_vocab_size(manifest), "--prompt-text")
+    return token_ids
+
+
+def _decode_token_ids(tokenizer, token_ids):
+    if token_ids is None:
+        return None
+    return tokenizer.decode([int(token_id) for token_id in token_ids], skip_special_tokens=False)
+
+
+def _add_decoded_text(result, tokenizer):
+    decoded = {}
+    if result.get("input_ids") is not None:
+        decoded["input_text"] = _decode_token_ids(tokenizer, result["input_ids"])
+    if result.get("prompt_ids") is not None:
+        decoded["prompt_text"] = _decode_token_ids(tokenizer, result["prompt_ids"])
+    if result.get("new_token_ids") is not None:
+        decoded["new_text"] = _decode_token_ids(tokenizer, result["new_token_ids"])
+    if result.get("generated_ids") is not None:
+        decoded["generated_text"] = _decode_token_ids(tokenizer, result["generated_ids"])
+    result["decoded_text"] = decoded
+    if "input_text" in decoded:
+        result["input_text"] = decoded["input_text"]
+    if "prompt_text" in decoded:
+        if "prompt_text" in result:
+            result["decoded_prompt_text"] = decoded["prompt_text"]
+        else:
+            result["prompt_text"] = decoded["prompt_text"]
+    if "new_text" in decoded:
+        result["new_text"] = decoded["new_text"]
+    if "generated_text" in decoded:
+        result["generated_text"] = decoded["generated_text"]
+    return result
+
+
+def _compact_generation_result(turn, turn_input_ids, generation, tokenizer=None):
+    result = {
+        "turn": turn,
+        "input_ids": list(turn_input_ids),
+        "prompt_ids": generation["prompt_ids"],
+        "generated_ids": generation["generated_ids"],
+        "new_token_ids": generation["new_token_ids"],
+        "topk": [
+            {
+                "step": step["step"],
+                "selected_token_id": step["selected_token_id"],
+                "topk": step["topk"],
+            }
+            for step in generation["per_step_topk"]
+        ],
+        "stop_reason": generation["stop_reason"],
+        "decode_steps": generation["decode_steps"],
+        "cache_shapes": generation["cache_shapes"],
+    }
+    if tokenizer is not None:
+        _add_decoded_text(result, tokenizer)
+    return result
+
+
+def _compact_text_result(prompt_text, result, tokenizer, manifest):
+    generation = result.get("token_generation")
+    if generation is not None:
+        compact = _compact_generation_result(0, result.get("input_ids") or [], generation, tokenizer)
+    else:
+        compact = {
+            "mode": result["mode"],
+            "input_ids": result.get("input_ids"),
+            "prompt_ids": result.get("input_ids"),
+            "logits_shape": result.get("logits_shape"),
+            "next_token_topk": result.get("next_token_topk", []),
+        }
+        if tokenizer is not None:
+            _add_decoded_text(compact, tokenizer)
+    compact["mode"] = result["mode"]
+    compact["prompt_text"] = prompt_text
+    compact["tokenizer"] = _tokenizer_info(tokenizer, manifest) if tokenizer is not None else None
+    compact["logits_shape"] = result.get("logits_shape")
+    compact["next_token_topk"] = result.get("next_token_topk", [])
+    compact["simulation_summary"] = result.get("simulation_summary")
+    return compact
 
 
 def _parse_input_ids(raw):
     values = [part.strip() for part in raw.split(",") if part.strip()]
     if not values:
-        raise ValueError("--input-ids must contain at least one comma-separated integer")
+        raise ValueError("token ID input must contain at least one comma-separated integer")
     return [int(value) for value in values]
 
 
-def _runtime_simulation_summary(manifest, no_patch):
+def _load_runtime(manifest_path, weights_path=None, digital_path=None, seed=0):
+    _configure_local_caches(manifest_path.parent)
+    manifest = _load_manifest(manifest_path)
+    weights_path = weights_path or manifest_path.with_name(manifest["weights_file"])
+    if digital_path is None and manifest.get("digital_tensors_file"):
+        digital_path = manifest_path.with_name(manifest["digital_tensors_file"])
+    raw_weights = weights_path.read_bytes()
+
+    try:
+        import torch
+    except ImportError as exc:
+        raise SystemExit(
+            "AIHWKIT simulation requires torch and aihwkit. Install them in this Python environment first."
+        ) from exc
+    torch.manual_seed(seed)
+    sim_model = build_aihwkit_model(manifest, raw_weights)
+    digital_tensors = _load_digital_tensors(manifest, digital_path)
+    return manifest, sim_model, digital_tensors
+
+
+def _runtime_simulation_summary(manifest):
     summary = dict(manifest.get("simulation_summary") or {})
-    memtorch_stages = summary.get(
-        "memtorch_stages", [projection["stage"] for projection in manifest.get("projections", [])]
+    aihwkit_stages = summary.get(
+        "aihwkit_stages", [projection["stage"] for projection in manifest.get("projections", [])]
     )
     digital_stages = summary.get("digital_stages", [])
     summary.update(
         {
-            "memtorch_patched": not no_patch,
-            "patched_projection_count": len(manifest.get("projections", [])),
-            "memtorch_stages": memtorch_stages,
+            "backend": "aihwkit",
+            "analog_projection_count": len(manifest.get("projections", [])),
+            "aihwkit_stages": aihwkit_stages,
             "digital_stages": digital_stages,
             "supported_runtime_modes": summary.get(
                 "supported_runtime_modes", ["logits"]
@@ -568,30 +780,18 @@ def run(
     batch_size=1,
     seq_len=4,
     seed=0,
-    no_patch=False,
     input_ids=None,
     top_k=5,
     generate_ids=False,
     max_new_tokens=8,
     eos_token_id=None,
 ):
-    _configure_local_caches(manifest_path.parent)
-    manifest = json.loads(manifest_path.read_text())
-    weights_path = weights_path or manifest_path.with_name(manifest["weights_file"])
-    if digital_path is None and manifest.get("digital_tensors_file"):
-        digital_path = manifest_path.with_name(manifest["digital_tensors_file"])
-    raw_weights = weights_path.read_bytes()
-
-    try:
-        import torch
-    except ImportError as exc:
-        raise SystemExit(
-            "MemTorch simulation requires torch and memtorch. Install them in this Python environment first."
-        ) from exc
-    torch.manual_seed(seed)
-    model = build_torch_model(manifest, raw_weights)
-    sim_model = model if no_patch else patch_with_memtorch(model, manifest)
-    digital_tensors = _load_digital_tensors(manifest, digital_path)
+    manifest, sim_model, digital_tensors = _load_runtime(
+        manifest_path,
+        weights_path=weights_path,
+        digital_path=digital_path,
+        seed=seed,
+    )
 
     results = _run_projection_smoke(sim_model, manifest, batch_size)
     attention_slice = run_attention_slice(sim_model, manifest, batch_size, seq_len)
@@ -611,7 +811,7 @@ def run(
         else None
     )
     mode = "generate_ids" if token_generation else token_logits["mode"] if token_logits else "attention_slice"
-    simulation_summary = _runtime_simulation_summary(manifest, no_patch)
+    simulation_summary = _runtime_simulation_summary(manifest)
     return {
         "mode": mode,
         "entry": manifest["entry"],
@@ -636,40 +836,236 @@ def run(
     }
 
 
+def run_interactive_ids(
+    manifest_path,
+    weights_path=None,
+    digital_path=None,
+    seed=0,
+    initial_ids=None,
+    top_k=5,
+    max_new_tokens=8,
+    eos_token_id=None,
+    tokenizer=None,
+):
+    manifest, sim_model, digital_tensors = _load_runtime(
+        manifest_path,
+        weights_path=weights_path,
+        digital_path=digital_path,
+        seed=seed,
+    )
+    if not manifest.get("inference_slice"):
+        raise ValueError("manifest does not contain an interactive token inference slice")
+
+    context_ids = list(initial_ids or [])
+    turn = 0
+    while True:
+        sys.stderr.write("ids> ")
+        sys.stderr.flush()
+        line = sys.stdin.readline()
+        if line == "":
+            break
+        line = line.strip()
+        if line.lower() in {"exit", "quit"}:
+            break
+
+        turn_input_ids = []
+        try:
+            if line:
+                turn_input_ids = _parse_input_ids(line)
+                context_ids.extend(turn_input_ids)
+            if not context_ids:
+                raise ValueError("enter comma-separated token IDs before generating")
+
+            generation = run_token_generation(
+                sim_model,
+                manifest,
+                digital_tensors,
+                context_ids,
+                max_new_tokens,
+                top_k,
+                eos_token_id=eos_token_id,
+            )
+            if generation is None:
+                raise ValueError("manifest does not support token generation")
+            context_ids = list(generation["generated_ids"])
+            print(
+                json.dumps(
+                    _compact_generation_result(turn, turn_input_ids, generation, tokenizer),
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            turn += 1
+        except Exception as exc:
+            print(
+                json.dumps(
+                    {
+                        "turn": turn,
+                        "input_ids": turn_input_ids,
+                        "error": str(exc),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
+
+def run_interactive_text(
+    manifest_path,
+    weights_path=None,
+    digital_path=None,
+    seed=0,
+    tokenizer=None,
+    top_k=5,
+    max_new_tokens=8,
+    eos_token_id=None,
+):
+    manifest, sim_model, digital_tensors = _load_runtime(
+        manifest_path,
+        weights_path=weights_path,
+        digital_path=digital_path,
+        seed=seed,
+    )
+    if tokenizer is None:
+        raise ValueError("--interactive-text requires --tokenizer")
+    if not manifest.get("inference_slice"):
+        raise ValueError("manifest does not contain an interactive token inference slice")
+
+    turn = 0
+    while True:
+        sys.stderr.write("text> ")
+        sys.stderr.flush()
+        line = sys.stdin.readline()
+        if line == "":
+            break
+        prompt_text = line.rstrip("\n")
+        if prompt_text.lower() in {"exit", "quit"}:
+            break
+
+        try:
+            input_ids = _encode_prompt_text(tokenizer, prompt_text, manifest)
+            generation = run_token_generation(
+                sim_model,
+                manifest,
+                digital_tensors,
+                input_ids,
+                max_new_tokens,
+                top_k,
+                eos_token_id=eos_token_id,
+            )
+            if generation is None:
+                raise ValueError("manifest does not support token generation")
+            result = _compact_generation_result(turn, input_ids, generation, tokenizer)
+            result["prompt_text"] = prompt_text
+            result["tokenizer"] = _tokenizer_info(tokenizer, manifest)
+            print(json.dumps(result, sort_keys=True), flush=True)
+            turn += 1
+        except Exception as exc:
+            print(
+                json.dumps(
+                    {
+                        "turn": turn,
+                        "prompt_text": prompt_text,
+                        "error": str(exc),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Run cim_compile output through MemTorch.")
-    parser.add_argument("--manifest", default="memtorch_manifest.json")
+    parser = argparse.ArgumentParser(description="Run cim_compile output through AIHWKIT.")
+    parser.add_argument("--manifest", default="aihwkit_manifest.json")
     parser.add_argument("--weights", default=None)
     parser.add_argument("--digital", default=None)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seq-len", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--input-ids", default="1,2,3,4")
+    parser.add_argument("--input-ids", default=None)
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--generate-ids", action="store_true")
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--eos-token-id", type=int, default=None)
-    parser.add_argument(
-        "--no-patch",
-        action="store_true",
-        help="Run the reconstructed PyTorch model without MemTorch patching.",
-    )
+    parser.add_argument("--interactive-ids", action="store_true")
+    parser.add_argument("--interactive-text", action="store_true")
+    parser.add_argument("--prompt-text", default=None)
+    parser.add_argument("--tokenizer", default=None)
+    parser.add_argument("--decode-text", action="store_true")
     args = parser.parse_args()
 
+    if args.interactive_ids and args.interactive_text:
+        raise SystemExit("--interactive-ids and --interactive-text cannot be combined")
+    if args.prompt_text is not None and args.input_ids is not None:
+        raise SystemExit("--prompt-text and --input-ids cannot be combined")
+    if args.interactive_text and args.input_ids is not None:
+        raise SystemExit("--interactive-text and --input-ids cannot be combined")
+    if args.interactive_text and args.prompt_text is not None:
+        raise SystemExit("--interactive-text and --prompt-text cannot be combined")
+
+    manifest_path = Path(args.manifest)
+    manifest = _load_manifest(manifest_path)
+
+    tokenizer = None
+    if args.prompt_text is not None or args.decode_text or args.interactive_text:
+        requested_by = "--prompt-text" if args.prompt_text is not None else "--decode-text"
+        if args.interactive_text:
+            requested_by = "--interactive-text"
+        tokenizer = _load_tokenizer(args.tokenizer, requested_by, manifest)
+
+    if args.prompt_text is not None:
+        input_ids = _encode_prompt_text(tokenizer, args.prompt_text, manifest)
+    elif args.input_ids is not None:
+        input_ids = _parse_input_ids(args.input_ids)
+    elif args.interactive_ids:
+        input_ids = []
+    else:
+        input_ids = None
+
+    if args.interactive_text:
+        run_interactive_text(
+            manifest_path,
+            Path(args.weights) if args.weights else None,
+            Path(args.digital) if args.digital else None,
+            seed=args.seed,
+            tokenizer=tokenizer,
+            top_k=args.top_k,
+            max_new_tokens=args.max_new_tokens,
+            eos_token_id=args.eos_token_id,
+        )
+        return
+
+    if args.interactive_ids:
+        run_interactive_ids(
+            manifest_path,
+            Path(args.weights) if args.weights else None,
+            Path(args.digital) if args.digital else None,
+            seed=args.seed,
+            initial_ids=input_ids,
+            top_k=args.top_k,
+            max_new_tokens=args.max_new_tokens,
+            eos_token_id=args.eos_token_id,
+            tokenizer=tokenizer if args.decode_text else None,
+        )
+        return
+
     result = run(
-        Path(args.manifest),
+        manifest_path,
         Path(args.weights) if args.weights else None,
         Path(args.digital) if args.digital else None,
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         seed=args.seed,
-        no_patch=args.no_patch,
-        input_ids=_parse_input_ids(args.input_ids),
+        input_ids=input_ids,
         top_k=args.top_k,
         generate_ids=args.generate_ids,
         max_new_tokens=args.max_new_tokens,
         eos_token_id=args.eos_token_id,
     )
+    if args.prompt_text is not None:
+        result = _compact_text_result(args.prompt_text, result, tokenizer, manifest)
+    if args.decode_text:
+        _add_decoded_text(result, tokenizer)
     print(json.dumps(result, indent=2, sort_keys=True))
 
 

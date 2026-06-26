@@ -1,8 +1,8 @@
 use cim_compile::CompileConfig;
+use cim_compile::aihwkit::{build_package, manifest_json};
 use cim_compile::cim::{ProjectionKind, parse_program};
 use cim_compile::ir::{NormalizedOp, NormalizedProgram, ProjectionOp};
 use cim_compile::lowering::lower_program;
-use cim_compile::memtorch::{build_package, manifest_json};
 
 fn tiny_program() -> NormalizedProgram {
     NormalizedProgram::new(
@@ -23,14 +23,14 @@ fn tiny_program() -> NormalizedProgram {
 
 #[test]
 fn golden_cim_text_for_tiny_projection() {
-    let lowered = lower_program(&tiny_program(), CompileConfig::square(1, 8)).unwrap();
+    let lowered = lower_program(&tiny_program(), CompileConfig::square(1)).unwrap();
     let expected = concat!(
         "cim.module @cim_compile {\n",
         "  cim.func @main {\n",
-        "    cim.tile.dispatch { projection = \"main\", tile = [0, 0], matrix_shape = [2, 2], tile_size = [1, 1], weight_offset = 0, quant_scale = 0.007874016, order = 0 }\n",
-        "    cim.tile.dispatch { projection = \"main\", tile = [0, 1], matrix_shape = [2, 2], tile_size = [1, 1], weight_offset = 1, quant_scale = 1.0, order = 1 }\n",
-        "    cim.tile.dispatch { projection = \"main\", tile = [1, 0], matrix_shape = [2, 2], tile_size = [1, 1], weight_offset = 2, quant_scale = 0.003937008, order = 2 }\n",
-        "    cim.tile.dispatch { projection = \"main\", tile = [1, 1], matrix_shape = [2, 2], tile_size = [1, 1], weight_offset = 3, quant_scale = 0.007874016, order = 3 }\n",
+        "    cim.tile.dispatch { projection = \"main\", tile = [0, 0], matrix_shape = [2, 2], tile_size = [1, 1], weight_offset = 0, order = 0 }\n",
+        "    cim.tile.dispatch { projection = \"main\", tile = [0, 1], matrix_shape = [2, 2], tile_size = [1, 1], weight_offset = 4, order = 1 }\n",
+        "    cim.tile.dispatch { projection = \"main\", tile = [1, 0], matrix_shape = [2, 2], tile_size = [1, 1], weight_offset = 8, order = 2 }\n",
+        "    cim.tile.dispatch { projection = \"main\", tile = [1, 1], matrix_shape = [2, 2], tile_size = [1, 1], weight_offset = 12, order = 3 }\n",
         "  }\n",
         "}\n"
     );
@@ -40,20 +40,28 @@ fn golden_cim_text_for_tiny_projection() {
 }
 
 #[test]
-fn golden_memtorch_manifest_for_tiny_projection() {
+fn golden_aihwkit_manifest_for_tiny_projection() {
     let normalized = tiny_program();
-    let lowered = lower_program(&normalized, CompileConfig::square(1, 8)).unwrap();
+    let lowered = lower_program(&normalized, CompileConfig::square(1)).unwrap();
     let package = build_package(&normalized, &lowered).unwrap();
     let expected = concat!(
         "{\n",
         "  \"schema_version\": 1,\n",
+        "  \"backend\": \"aihwkit\",\n",
         "  \"entry\": \"tiny\",\n",
         "  \"tile_size\": [\n",
         "    1,\n",
         "    1\n",
         "  ],\n",
-        "  \"quant_bits\": 8,\n",
-        "  \"weights_file\": \"memtorch_weights.bin\",\n",
+        "  \"weight_dtype\": \"f32\",\n",
+        "  \"weights_file\": \"aihwkit_weights.bin\",\n",
+        "  \"rpu_config\": {\n",
+        "    \"preset\": \"ideal_torch_inference\",\n",
+        "    \"analog_module\": \"AnalogLinearMapped\",\n",
+        "    \"max_input_size\": 1,\n",
+        "    \"max_output_size\": 1,\n",
+        "    \"digital_bias\": true\n",
+        "  },\n",
         "  \"projections\": [\n",
         "    {\n",
         "      \"name\": \"main\",\n",
@@ -81,7 +89,7 @@ fn golden_memtorch_manifest_for_tiny_projection() {
         "            1\n",
         "          ],\n",
         "          \"weight_offset\": 0,\n",
-        "          \"quant_scale\": 0.007874016,\n",
+        "          \"byte_len\": 4,\n",
         "          \"order\": 0\n",
         "        },\n",
         "        {\n",
@@ -99,8 +107,8 @@ fn golden_memtorch_manifest_for_tiny_projection() {
         "            1,\n",
         "            1\n",
         "          ],\n",
-        "          \"weight_offset\": 1,\n",
-        "          \"quant_scale\": 1.0,\n",
+        "          \"weight_offset\": 4,\n",
+        "          \"byte_len\": 4,\n",
         "          \"order\": 1\n",
         "        },\n",
         "        {\n",
@@ -118,8 +126,8 @@ fn golden_memtorch_manifest_for_tiny_projection() {
         "            1,\n",
         "            1\n",
         "          ],\n",
-        "          \"weight_offset\": 2,\n",
-        "          \"quant_scale\": 0.003937008,\n",
+        "          \"weight_offset\": 8,\n",
+        "          \"byte_len\": 4,\n",
         "          \"order\": 2\n",
         "        },\n",
         "        {\n",
@@ -137,8 +145,8 @@ fn golden_memtorch_manifest_for_tiny_projection() {
         "            1,\n",
         "            1\n",
         "          ],\n",
-        "          \"weight_offset\": 3,\n",
-        "          \"quant_scale\": 0.007874016,\n",
+        "          \"weight_offset\": 12,\n",
+        "          \"byte_len\": 4,\n",
         "          \"order\": 3\n",
         "        }\n",
         "      ]\n",
@@ -166,10 +174,13 @@ fn golden_memtorch_manifest_for_tiny_projection() {
 }
 
 #[test]
-fn golden_memtorch_weight_payload_for_tiny_projection() {
+fn golden_aihwkit_weight_payload_for_tiny_projection() {
     let normalized = tiny_program();
-    let lowered = lower_program(&normalized, CompileConfig::square(1, 8)).unwrap();
+    let lowered = lower_program(&normalized, CompileConfig::square(1)).unwrap();
     let package = build_package(&normalized, &lowered).unwrap();
 
-    assert_eq!(package.weights, vec![129, 0, 127, 127]);
+    assert_eq!(
+        package.weights,
+        vec![0, 0, 128, 191, 0, 0, 0, 0, 0, 0, 0, 63, 0, 0, 128, 63]
+    );
 }

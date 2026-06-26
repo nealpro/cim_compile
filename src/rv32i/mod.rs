@@ -225,8 +225,8 @@ fn file_header(program: &CimProgram) -> String {
 
     for op in dispatches {
         lines.push(format!(
-            "#   [{:>2}]  {}  tile[{},{}]  weights@{}  scale={:?}",
-            op.order, op.projection, op.tile.row, op.tile.col, op.weight_offset, op.quant_scale
+            "#   [{:>2}]  {}  tile[{},{}]  weights@{}",
+            op.order, op.projection, op.tile.row, op.tile.col, op.weight_offset
         ));
     }
     lines.join("\n")
@@ -251,7 +251,6 @@ mod tests {
                 matrix_shape: MatrixShape::new(1, 1),
                 tile_size,
                 weight_offset: expected_weight_offset(0, tile_size),
-                quant_scale: 1.0,
                 order: 0,
             }],
         )

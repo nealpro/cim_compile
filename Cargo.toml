@@ -2,8 +2,8 @@
 name = "cim_compile"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.95"
-description = "Rust CiM compiler that lowers ONNX transformer attention blocks into a MemTorch simulation path"
+rust-version = "1.96"
+description = "Rust CiM compiler that lowers ONNX model slices into AIHWKIT simulation packages"
 license = "MIT"
 repository = "https://github.com/nealpro/cim_compile"
 

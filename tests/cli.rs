@@ -92,6 +92,32 @@ fn run_model(model_path: &str) -> PathBuf {
     run_model_with_args(model_path, &[])
 }
 
+fn run_model_with_env(model_path: &str, extra_args: &[&str], envs: &[(&str, &Path)]) -> PathBuf {
+    let out_dir = temp_output_dir(
+        Path::new(model_path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("model"),
+    );
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cim_compile"));
+    command.arg(model_path).arg("-o").arg(&out_dir);
+    command.args(extra_args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command.output().expect("failed to run cim_compile");
+
+    assert!(
+        output.status.success(),
+        "cim_compile failed for {model_path}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    out_dir
+}
+
 fn run_model_expect_failure(model_path: &str, extra_args: &[&str]) -> String {
     let out_dir = temp_output_dir(
         Path::new(model_path)
@@ -126,11 +152,11 @@ fn assert_outputs_with_digital(
     expect_digital: bool,
 ) {
     let cim_path = out_dir.join("output.cim");
-    let manifest_path = out_dir.join("memtorch_manifest.json");
-    let weights_path = out_dir.join("memtorch_weights.bin");
-    let digital_path = out_dir.join("memtorch_digital.bin");
-    let runner_path = out_dir.join("run_memtorch.py");
-    let payload_bytes = tile_size as usize * tile_size as usize;
+    let manifest_path = out_dir.join("aihwkit_manifest.json");
+    let weights_path = out_dir.join("aihwkit_weights.bin");
+    let digital_path = out_dir.join("aihwkit_digital.bin");
+    let runner_path = out_dir.join("run_aihwkit.py");
+    let payload_bytes = tile_size as usize * tile_size as usize * std::mem::size_of::<f32>();
     let expected_weight_file_bytes = expected_tiles as usize * payload_bytes;
 
     assert!(cim_path.exists(), "missing {}", cim_path.display());
@@ -164,9 +190,11 @@ fn assert_outputs_with_digital(
 
     let manifest = fs::read_to_string(&manifest_path).expect("failed to read manifest");
     assert!(manifest.contains("\"schema_version\": 1"));
-    assert!(manifest.contains("\"weights_file\": \"memtorch_weights.bin\""));
+    assert!(manifest.contains("\"backend\": \"aihwkit\""));
+    assert!(manifest.contains("\"weight_dtype\": \"f32\""));
+    assert!(manifest.contains("\"weights_file\": \"aihwkit_weights.bin\""));
     if expect_digital {
-        assert!(manifest.contains("\"digital_tensors_file\": \"memtorch_digital.bin\""));
+        assert!(manifest.contains("\"digital_tensors_file\": \"aihwkit_digital.bin\""));
     }
     assert!(manifest.contains(&format!("\"order\": {}", expected_tiles - 1)));
 }
@@ -200,18 +228,6 @@ fn cli_compiles_custom_tile_size() {
 }
 
 #[test]
-fn cli_rejects_invalid_quantization_bits() {
-    let stderr = run_model_expect_failure(
-        generated_fixture_path("memristor_mha_unrolled.onnx")
-            .to_str()
-            .unwrap(),
-        &["--bits", "6"],
-    );
-
-    assert!(stderr.contains("unsupported quantization bit-width 6"));
-}
-
-#[test]
 fn cli_compiles_non_divisible_tile_size_with_padding() {
     let out_dir = run_model_with_args(
         generated_fixture_path("memristor_mha_unrolled.onnx")
@@ -221,6 +237,143 @@ fn cli_compiles_non_divisible_tile_size_with_padding() {
     );
 
     assert_outputs(&out_dir, 144, 100);
+}
+
+#[test]
+fn cli_help_distinguishes_token_id_and_text_modes() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cim_compile"))
+        .arg("--help")
+        .output()
+        .expect("failed to run cim_compile --help");
+
+    assert!(
+        output.status.success(),
+        "help failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--input-ids <INPUT_IDS>"));
+    assert!(stdout.contains("not prompt text"));
+    assert!(stdout.contains("--interactive-ids"));
+    assert!(stdout.contains("token IDs in token-ID mode"));
+    assert!(stdout.contains("--interactive-text"));
+    assert!(stdout.contains("prompt text in text/tokenizer mode"));
+    assert!(stdout.contains("--prompt-text <PROMPT_TEXT>"));
+    assert!(stdout.contains("text/tokenizer mode"));
+    assert!(stdout.contains("--tokenizer <TOKENIZER>"));
+    assert!(stdout.contains("--decode-text"));
+}
+
+#[test]
+fn cli_prompt_text_without_run_aihwkit_only_writes_artifacts() {
+    let missing_python = temp_output_dir("missing_python").join("python");
+    let out_dir = run_model_with_args(
+        generated_fixture_path("memristor_mha_unrolled.onnx")
+            .to_str()
+            .unwrap(),
+        &[
+            "--prompt-text",
+            "hello from text mode",
+            "--tokenizer",
+            "local-tokenizer-or-name",
+            "--decode-text",
+            "--python",
+            missing_python.to_str().unwrap(),
+        ],
+    );
+
+    assert_outputs(&out_dir, DEFAULT_EXPECTED_TILES, DEFAULT_TILE_SIZE);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_forwards_one_shot_text_options_to_python_runner_when_asked_to_run() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script_dir = temp_output_dir("fake_python");
+    fs::create_dir_all(&script_dir).expect("failed to create fake python directory");
+    let fake_python = script_dir.join("python");
+    let captured_args = script_dir.join("args.txt");
+    fs::write(
+        &fake_python,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CIM_COMPILE_CAPTURE_ARGS\"\nexit 0\n",
+    )
+    .expect("failed to write fake python");
+    let mut permissions = fs::metadata(&fake_python)
+        .expect("failed to stat fake python")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_python, permissions).expect("failed to chmod fake python");
+
+    run_model_with_env(
+        generated_fixture_path("memristor_mha_unrolled.onnx")
+            .to_str()
+            .unwrap(),
+        &[
+            "--run-aihwkit",
+            "--python",
+            fake_python.to_str().unwrap(),
+            "--generate-ids",
+            "--prompt-text",
+            "hello from text mode",
+            "--tokenizer",
+            "local-tokenizer-or-name",
+            "--decode-text",
+        ],
+        &[("CIM_COMPILE_CAPTURE_ARGS", &captured_args)],
+    );
+
+    let args = fs::read_to_string(&captured_args).expect("failed to read captured args");
+    assert!(args.contains("-m\ncim_compile_aihwkit.runner\n"));
+    assert!(args.contains("--generate-ids\n"));
+    assert!(args.contains("--prompt-text\nhello from text mode\n"));
+    assert!(args.contains("--tokenizer\nlocal-tokenizer-or-name\n"));
+    assert!(args.contains("--decode-text\n"));
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_forwards_interactive_text_to_python_runner_when_asked_to_run() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script_dir = temp_output_dir("fake_python_interactive_text");
+    fs::create_dir_all(&script_dir).expect("failed to create fake python directory");
+    let fake_python = script_dir.join("python");
+    let captured_args = script_dir.join("args.txt");
+    fs::write(
+        &fake_python,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CIM_COMPILE_CAPTURE_ARGS\"\nexit 0\n",
+    )
+    .expect("failed to write fake python");
+    let mut permissions = fs::metadata(&fake_python)
+        .expect("failed to stat fake python")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_python, permissions).expect("failed to chmod fake python");
+
+    run_model_with_env(
+        generated_fixture_path("memristor_mha_unrolled.onnx")
+            .to_str()
+            .unwrap(),
+        &[
+            "--run-aihwkit",
+            "--python",
+            fake_python.to_str().unwrap(),
+            "--interactive-text",
+            "--tokenizer",
+            "local-tokenizer-or-name",
+            "--decode-text",
+        ],
+        &[("CIM_COMPILE_CAPTURE_ARGS", &captured_args)],
+    );
+
+    let args = fs::read_to_string(&captured_args).expect("failed to read captured args");
+    assert!(args.contains("-m\ncim_compile_aihwkit.runner\n"));
+    assert!(args.contains("--interactive-text\n"));
+    assert!(args.contains("--tokenizer\nlocal-tokenizer-or-name\n"));
+    assert!(args.contains("--decode-text\n"));
 }
 
 #[test]
@@ -236,7 +389,7 @@ fn cli_compiles_required_real_tiny_model_token_logits_slice() {
 
     assert_outputs_with_digital(&out_dir, REAL_MODEL_EXPECTED_TILES, DEFAULT_TILE_SIZE, true);
 
-    let manifest_path = out_dir.join("memtorch_manifest.json");
+    let manifest_path = out_dir.join("aihwkit_manifest.json");
     let manifest: Value =
         serde_json::from_str(&fs::read_to_string(&manifest_path).expect("failed to read manifest"))
             .expect("manifest should be valid JSON");
@@ -301,6 +454,15 @@ fn cli_compiles_required_real_tiny_model_token_logits_slice() {
         plan.iter()
             .any(|entry| { entry["stage"] == "lm_head.matmul" && entry["target"] == "digital" })
     );
+    let lm_head = plan
+        .iter()
+        .find(|entry| entry["stage"] == "lm_head.matmul")
+        .expect("execution plan should include lm_head.matmul");
+    let lm_head_reason = lm_head["reason"]
+        .as_str()
+        .expect("lm_head.matmul should include a reason");
+    assert!(!lm_head_reason.contains("32k-vocabulary"));
+    assert!(lm_head_reason.contains("vocab_size = 32000"));
 
     let inference = &manifest["inference_slice"];
     assert_eq!(inference["model_kind"], "tiny_decoder_v1");
@@ -312,26 +474,34 @@ fn cli_compiles_required_real_tiny_model_token_logits_slice() {
     assert_eq!(inference["grouped_query_attention"], true);
     assert_eq!(manifest["digital_tensors"].as_array().unwrap().len(), 5);
 
+    let topology = &manifest["model_topology"];
+    assert_eq!(topology["model_kind"], "tiny_decoder_v1");
+    assert_eq!(topology["decoder_layers"], 1);
+    assert_eq!(topology["vocab_size"], 32000);
+    assert_eq!(topology["hidden_size"], 192);
+
     let summary = &manifest["simulation_summary"];
-    assert_eq!(summary["patched_projection_count"], 7);
+    assert_eq!(summary["analog_projection_count"], 7);
+    assert_eq!(summary["decoder_layers"], 1);
+    assert_eq!(summary["vocab_size"], 32000);
     assert_eq!(summary["lm_head_target"], "digital");
     let modes = summary["supported_runtime_modes"].as_array().unwrap();
     assert!(modes.iter().any(|mode| mode == "logits"));
     assert!(modes.iter().any(|mode| mode == "generate_ids"));
-    let memtorch_stages = summary["memtorch_stages"].as_array().unwrap();
-    assert_eq!(memtorch_stages.len(), 7);
+    let aihwkit_stages = summary["aihwkit_stages"].as_array().unwrap();
+    assert_eq!(aihwkit_stages.len(), 7);
     assert!(
-        memtorch_stages
+        aihwkit_stages
             .iter()
             .any(|stage| stage == "attention.query_projection")
     );
     assert!(
-        memtorch_stages
+        aihwkit_stages
             .iter()
             .any(|stage| stage == "mlp.gate_projection")
     );
     assert!(
-        memtorch_stages
+        aihwkit_stages
             .iter()
             .any(|stage| stage == "mlp.down_projection")
     );
@@ -340,14 +510,14 @@ fn cli_compiles_required_real_tiny_model_token_logits_slice() {
 }
 
 #[test]
-fn cli_rejects_unavailable_memtorch_python_executable_when_asked_to_run() {
+fn cli_rejects_unavailable_aihwkit_python_executable_when_asked_to_run() {
     let missing_python = temp_output_dir("missing_python").join("python");
     let stderr = run_model_expect_failure(
         generated_fixture_path("memristor_mha_unrolled.onnx")
             .to_str()
             .unwrap(),
         &[
-            "--run-memtorch",
+            "--run-aihwkit",
             "--python",
             missing_python.to_str().unwrap(),
         ],

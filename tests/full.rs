@@ -41,8 +41,8 @@ fn test_python() -> String {
 }
 
 #[test]
-#[ignore = "requires a local real ONNX model and MemTorch; run with CIM_COMPILE_REAL_MODEL=/path/to/model.onnx cargo test --test full -- --ignored"]
-fn full_real_tiny_model_memtorch_token_logits_runs() {
+#[ignore = "requires a local real ONNX model and AIHWKIT; run with CIM_COMPILE_REAL_MODEL=/path/to/model.onnx cargo test --test full -- --ignored"]
+fn full_real_tiny_model_aihwkit_token_logits_runs() {
     let fixture = real_model_path();
     assert!(
         fixture.exists(),
@@ -57,7 +57,7 @@ fn full_real_tiny_model_memtorch_token_logits_runs() {
         .arg(&out_dir)
         .arg("--tile-size")
         .arg("128")
-        .arg("--run-memtorch")
+        .arg("--run-aihwkit")
         .arg("--python")
         .arg(test_python())
         .arg("--input-ids")
@@ -73,10 +73,10 @@ fn full_real_tiny_model_memtorch_token_logits_runs() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(out_dir.join("output.cim").exists());
-    assert!(out_dir.join("memtorch_manifest.json").exists());
-    assert!(out_dir.join("memtorch_weights.bin").exists());
-    assert!(out_dir.join("memtorch_digital.bin").exists());
-    assert!(!out_dir.join("run_memtorch.py").exists());
+    assert!(out_dir.join("aihwkit_manifest.json").exists());
+    assert!(out_dir.join("aihwkit_weights.bin").exists());
+    assert!(out_dir.join("aihwkit_digital.bin").exists());
+    assert!(!out_dir.join("run_aihwkit.py").exists());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("\"results\""));
@@ -89,7 +89,7 @@ fn full_real_tiny_model_memtorch_token_logits_runs() {
 
     let json_start = stdout
         .find("{\n  \"attention_blocks\"")
-        .expect("expected MemTorch JSON result in stdout");
+        .expect("expected AIHWKIT JSON result in stdout");
     let value: Value =
         serde_json::from_str(&stdout[json_start..]).expect("stdout JSON should parse");
     assert_eq!(value["mode"], json!("token_ids_to_logits"));
@@ -122,8 +122,8 @@ fn full_real_tiny_model_memtorch_token_logits_runs() {
 }
 
 #[test]
-#[ignore = "requires a local real ONNX model and MemTorch; run with CIM_COMPILE_REAL_MODEL=/path/to/model.onnx cargo test --test full -- --ignored"]
-fn full_real_tiny_model_memtorch_token_generation_runs() {
+#[ignore = "requires a local real ONNX model and AIHWKIT; run with CIM_COMPILE_REAL_MODEL=/path/to/model.onnx cargo test --test full -- --ignored"]
+fn full_real_tiny_model_aihwkit_token_generation_runs() {
     let fixture = real_model_path();
     assert!(
         fixture.exists(),
@@ -138,7 +138,7 @@ fn full_real_tiny_model_memtorch_token_generation_runs() {
         .arg(&out_dir)
         .arg("--tile-size")
         .arg("128")
-        .arg("--run-memtorch")
+        .arg("--run-aihwkit")
         .arg("--python")
         .arg(test_python())
         .arg("--generate-ids")
@@ -157,9 +157,9 @@ fn full_real_tiny_model_memtorch_token_generation_runs() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(out_dir.join("output.cim").exists());
-    assert!(out_dir.join("memtorch_manifest.json").exists());
-    assert!(out_dir.join("memtorch_weights.bin").exists());
-    assert!(out_dir.join("memtorch_digital.bin").exists());
+    assert!(out_dir.join("aihwkit_manifest.json").exists());
+    assert!(out_dir.join("aihwkit_weights.bin").exists());
+    assert!(out_dir.join("aihwkit_digital.bin").exists());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("\"generated_ids\""));
@@ -169,7 +169,7 @@ fn full_real_tiny_model_memtorch_token_generation_runs() {
 
     let json_start = stdout
         .find("{\n  \"attention_blocks\"")
-        .expect("expected MemTorch JSON result in stdout");
+        .expect("expected AIHWKIT JSON result in stdout");
     let value: Value =
         serde_json::from_str(&stdout[json_start..]).expect("stdout JSON should parse");
     assert_eq!(value["mode"], json!("generate_ids"));
@@ -178,11 +178,11 @@ fn full_real_tiny_model_memtorch_token_generation_runs() {
     assert_eq!(value["new_token_ids"].as_array().unwrap().len(), 2);
     assert_eq!(value["decode_steps"], json!(2));
     assert_eq!(value["stop_reason"], json!("max_new_tokens"));
+    assert_eq!(value["cache_shapes"]["layers"], json!(1));
     assert_eq!(value["cache_shapes"]["key"], json!([1, 1, 6, 96]));
     assert_eq!(value["cache_shapes"]["value"], json!([1, 1, 6, 96]));
-    assert_eq!(value["simulation_summary"]["memtorch_patched"], json!(true));
     assert_eq!(
-        value["simulation_summary"]["patched_projection_count"],
+        value["simulation_summary"]["analog_projection_count"],
         json!(7)
     );
 

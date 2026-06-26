@@ -12,7 +12,6 @@ pub struct LoweredProgram {
     pub tiles: Vec<LoweredTile>,
     pub execution_plan: Vec<OperationExecution>,
     pub attention_blocks: Vec<AttentionBlockPlan>,
-    pub quant_bits: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,9 +25,8 @@ pub struct LoweredTile {
     pub matrix_shape: MatrixShape,
     pub tile_size: TileSize,
     pub weight_offset: u64,
-    pub quant_scale: f32,
     pub order: u32,
-    pub payload: Vec<i8>,
+    pub payload: Vec<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,7 +51,6 @@ pub struct AttentionBlockPlan {
 }
 
 struct LoweringContext<'a> {
-    config: CompileConfig,
     tile_size: TileSize,
     dispatches: &'a mut Vec<TileDispatch>,
     tiles: &'a mut Vec<LoweredTile>,
@@ -66,7 +63,6 @@ pub fn lower_program(
     program: &NormalizedProgram,
     config: CompileConfig,
 ) -> Result<LoweredProgram, String> {
-    validate_bits(config.bits)?;
     let tile_size = TileSize::new(config.tile_rows, config.tile_cols);
     if tile_size.rows == 0 || tile_size.cols == 0 {
         return Err("tile size must be greater than zero".to_string());
@@ -84,7 +80,6 @@ pub fn lower_program(
 
     {
         let mut ctx = LoweringContext {
-            config,
             tile_size,
             dispatches: &mut dispatches,
             tiles: &mut tiles,
@@ -137,7 +132,6 @@ pub fn lower_program(
         tiles,
         execution_plan,
         attention_blocks,
-        quant_bits: config.bits,
     })
 }
 
@@ -304,12 +298,7 @@ fn lower_projection(
     parent: Option<String>,
     ctx: &mut LoweringContext<'_>,
 ) -> Result<(), String> {
-    let decision = choose_projection_target(
-        projection,
-        ctx.tile_size.rows,
-        ctx.tile_size.cols,
-        ctx.config.bits,
-    );
+    let decision = choose_projection_target(projection, ctx.tile_size.rows, ctx.tile_size.cols);
     let tile_count =
         projection.rows.div_ceil(ctx.tile_size.rows) * projection.cols.div_ceil(ctx.tile_size.cols);
     ctx.execution_plan.push(OperationExecution {
@@ -332,7 +321,6 @@ fn lower_projection(
         for tile_col in 0..col_tiles {
             let tile = TileCoord::new(tile_row, tile_col);
             let values = extract_tile(projection, tile, ctx.tile_size)?;
-            let (payload, scale) = quantize_f32_tile(&values, ctx.config.bits)?;
             let weight_offset = expected_weight_offset(*ctx.order, ctx.tile_size);
             let matrix_shape = MatrixShape::new(projection.rows, projection.cols);
             ctx.dispatches.push(TileDispatch {
@@ -341,7 +329,6 @@ fn lower_projection(
                 matrix_shape,
                 tile_size: ctx.tile_size,
                 weight_offset,
-                quant_scale: scale,
                 order: *ctx.order,
             });
             ctx.tiles.push(LoweredTile {
@@ -354,9 +341,8 @@ fn lower_projection(
                 matrix_shape,
                 tile_size: ctx.tile_size,
                 weight_offset,
-                quant_scale: scale,
                 order: *ctx.order,
-                payload,
+                payload: values,
             });
             let next_order = (*ctx.order)
                 .checked_add(1)
@@ -377,12 +363,7 @@ fn lower_attention_block(
     let mut block_reason = Vec::new();
 
     for (stage, projection) in block.projection_entries() {
-        let decision = choose_projection_target(
-            projection,
-            ctx.tile_size.rows,
-            ctx.tile_size.cols,
-            ctx.config.bits,
-        );
+        let decision = choose_projection_target(projection, ctx.tile_size.rows, ctx.tile_size.cols);
         block_reason.push(decision.reason.clone());
         cim_projection_names.push(projection.name.clone());
         lower_projection(projection, stage, Some(block.name.clone()), ctx)?;
@@ -425,38 +406,6 @@ fn lower_attention_block(
     Ok(())
 }
 
-pub fn quantize_f32_tile(values: &[f32], bits: u32) -> Result<(Vec<i8>, f32), String> {
-    let qmax = validate_bits(bits)?;
-    if values.iter().any(|value| !value.is_finite()) {
-        return Err("cannot quantize non-finite weight value".to_string());
-    }
-
-    let max_abs = values
-        .iter()
-        .map(|value| value.abs())
-        .fold(0.0_f32, f32::max);
-
-    if max_abs == 0.0 {
-        return Ok((vec![0; values.len()], 1.0));
-    }
-
-    let scale = max_abs / qmax as f32;
-    let quantized = values
-        .iter()
-        .map(|value| (value / scale).round().clamp(-(qmax as f32), qmax as f32) as i8)
-        .collect();
-    Ok((quantized, scale))
-}
-
-pub fn validate_bits(bits: u32) -> Result<i32, String> {
-    match bits {
-        4 | 8 => Ok((1_i32 << (bits - 1)) - 1),
-        _ => Err(format!(
-            "unsupported quantization bit-width {bits}; expected 4 or 8"
-        )),
-    }
-}
-
 fn extract_tile(
     projection: &ProjectionOp,
     tile: TileCoord,
@@ -485,10 +434,17 @@ fn extract_tile(
 }
 
 pub fn tile_payload_bytes(tiles: &[LoweredTile]) -> Vec<u8> {
-    tiles
+    let byte_len = tiles
         .iter()
-        .flat_map(|tile| tile.payload.iter().map(|value| *value as u8))
-        .collect()
+        .map(|tile| tile.payload.len() * std::mem::size_of::<f32>())
+        .sum();
+    let mut bytes = Vec::with_capacity(byte_len);
+    for tile in tiles {
+        for value in &tile.payload {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    bytes
 }
 
 #[cfg(test)]
@@ -583,58 +539,42 @@ mod tests {
     }
 
     #[test]
-    fn quantization_maps_known_values_to_int8() {
-        let (quantized, scale) = quantize_f32_tile(&[-1.0, 0.0, 0.5, 1.0], 8).unwrap();
-
-        assert!((scale - (1.0 / 127.0)).abs() < f32::EPSILON);
-        assert_eq!(quantized, vec![-127, 0, 64, 127]);
-    }
-
-    #[test]
-    fn quantization_maps_known_values_to_int4_range() {
-        let (quantized, scale) = quantize_f32_tile(&[-1.0, 0.0, 1.0], 4).unwrap();
-
-        assert!((scale - (1.0 / 7.0)).abs() < f32::EPSILON);
-        assert_eq!(quantized, vec![-7, 0, 7]);
-    }
-
-    #[test]
     fn lowering_sets_cim_offsets_and_tile_payloads() {
-        let lowered =
-            lower_program(&tiny_projection_program(), CompileConfig::square(1, 8)).unwrap();
+        let lowered = lower_program(&tiny_projection_program(), CompileConfig::square(1)).unwrap();
 
         assert_eq!(lowered.tiles.len(), 4);
         assert_eq!(lowered.program.entry.dispatches[0].weight_offset, 0);
-        assert_eq!(lowered.program.entry.dispatches[1].weight_offset, 1);
-        assert_eq!(lowered.tiles[0].payload, vec![-127]);
-        assert_eq!(lowered.tiles[1].payload, vec![0]);
-        assert_eq!(tile_payload_bytes(&lowered.tiles), vec![129, 0, 127, 127]);
+        assert_eq!(lowered.program.entry.dispatches[1].weight_offset, 4);
+        assert_eq!(lowered.tiles[0].payload, vec![-1.0]);
+        assert_eq!(lowered.tiles[1].payload, vec![0.0]);
+        assert_eq!(
+            tile_payload_bytes(&lowered.tiles),
+            vec![0, 0, 128, 191, 0, 0, 0, 0, 0, 0, 0, 63, 0, 0, 128, 63]
+        );
         assert_eq!(lowered.execution_plan[0].stage, "projection");
         assert_eq!(lowered.execution_plan[0].target, "cim");
     }
 
     #[test]
     fn lowering_pads_non_divisible_edge_tiles() {
-        let lowered =
-            lower_program(&tiny_projection_program(), CompileConfig::square(3, 8)).unwrap();
+        let lowered = lower_program(&tiny_projection_program(), CompileConfig::square(3)).unwrap();
 
         assert_eq!(lowered.tiles.len(), 1);
         assert_eq!(lowered.program.entry.dispatches[0].matrix_shape.rows, 2);
         assert_eq!(lowered.program.entry.dispatches[0].tile_size.rows, 3);
         assert_eq!(
             lowered.tiles[0].payload,
-            vec![-127, 0, 0, 64, 127, 0, 0, 0, 0]
+            vec![-1.0, 0.0, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0]
         );
         assert_eq!(
-            tile_payload_bytes(&lowered.tiles),
-            vec![129, 0, 0, 64, 127, 0, 0, 0, 0]
+            tile_payload_bytes(&lowered.tiles).len(),
+            9 * std::mem::size_of::<f32>()
         );
     }
 
     #[test]
     fn attention_block_lowers_as_hybrid_plan() {
-        let lowered =
-            lower_program(&tiny_attention_program(), CompileConfig::square(1, 8)).unwrap();
+        let lowered = lower_program(&tiny_attention_program(), CompileConfig::square(1)).unwrap();
 
         assert_eq!(lowered.tiles.len(), 16);
         assert_eq!(lowered.attention_blocks.len(), 1);

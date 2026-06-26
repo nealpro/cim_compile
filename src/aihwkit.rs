@@ -4,21 +4,25 @@ use crate::ir::NormalizedProgram;
 use crate::lowering::{LoweredProgram, tile_payload_bytes};
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct MemtorchPackage {
-    pub manifest: MemtorchManifest,
+pub struct AihwkitPackage {
+    pub manifest: AihwkitManifest,
     pub weights: Vec<u8>,
     pub digital: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MemtorchManifest {
+pub struct AihwkitManifest {
     pub schema_version: u32,
+    pub backend: String,
     pub entry: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_topology: Option<ModelTopologyManifest>,
     pub tile_size: [u32; 2],
-    pub quant_bits: u32,
+    pub weight_dtype: String,
     pub weights_file: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digital_tensors_file: Option<String>,
+    pub rpu_config: RpuConfigManifest,
     pub projections: Vec<ProjectionManifest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub digital_tensors: Vec<DigitalTensorManifest>,
@@ -28,6 +32,25 @@ pub struct MemtorchManifest {
     pub inference_slice: Option<InferenceSliceManifest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub simulation_summary: Option<SimulationSummaryManifest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RpuConfigManifest {
+    pub preset: String,
+    pub analog_module: String,
+    pub max_input_size: u32,
+    pub max_output_size: u32,
+    pub digital_bias: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelTopologyManifest {
+    pub model_kind: String,
+    pub source_prefix: String,
+    pub decoder_layers: u32,
+    pub default_sequence_length: u32,
+    pub vocab_size: u32,
+    pub hidden_size: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -54,7 +77,7 @@ pub struct TileManifest {
     pub matrix_shape: [u32; 2],
     pub tile_size: [u32; 2],
     pub weight_offset: u64,
-    pub quant_scale: f32,
+    pub byte_len: u64,
     pub order: u32,
 }
 
@@ -126,9 +149,13 @@ pub struct InferenceSliceManifest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimulationSummaryManifest {
     pub supported_runtime_modes: Vec<String>,
-    pub memtorch_stages: Vec<String>,
+    pub aihwkit_stages: Vec<String>,
     pub digital_stages: Vec<String>,
-    pub patched_projection_count: u32,
+    pub analog_projection_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decoder_layers: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vocab_size: Option<u32>,
     pub lm_head_target: String,
 }
 
@@ -176,9 +203,7 @@ fn build_projection_manifests(
     Ok(projections)
 }
 
-fn build_digital_tensors(
-    normalized: &NormalizedProgram,
-) -> Result<(Vec<DigitalTensorManifest>, Vec<u8>), String> {
+fn build_digital_tensors(normalized: &NormalizedProgram) -> (Vec<DigitalTensorManifest>, Vec<u8>) {
     let mut manifest = Vec::new();
     let mut bytes = Vec::new();
 
@@ -203,7 +228,7 @@ fn build_digital_tensors(
         }
     }
 
-    Ok((manifest, bytes))
+    (manifest, bytes)
 }
 
 fn build_inference_slice(normalized: &NormalizedProgram) -> Option<InferenceSliceManifest> {
@@ -252,13 +277,27 @@ fn build_inference_slice(normalized: &NormalizedProgram) -> Option<InferenceSlic
                 "lm_head.matmul".to_string(),
             ],
             unsupported: vec![
-                "text tokenization".to_string(),
-                "text generation from tokenizer strings".to_string(),
+                "bundled tokenizer artifacts".to_string(),
+                "implicit text generation without an explicit --tokenizer".to_string(),
                 "non-greedy sampling controls".to_string(),
                 "non-empty KV cache decoding".to_string(),
                 "arbitrary ONNX transformer graphs".to_string(),
             ],
         })
+    })
+}
+
+fn build_model_topology(
+    inference_slice: &Option<InferenceSliceManifest>,
+) -> Option<ModelTopologyManifest> {
+    let inference_slice = inference_slice.as_ref()?;
+    Some(ModelTopologyManifest {
+        model_kind: inference_slice.model_kind.clone(),
+        source_prefix: inference_slice.source_prefix.clone(),
+        decoder_layers: inference_slice.decoder_layers,
+        default_sequence_length: inference_slice.default_sequence_length,
+        vocab_size: inference_slice.vocab_size,
+        hidden_size: inference_slice.hidden_size,
     })
 }
 
@@ -269,14 +308,32 @@ fn build_simulation_summary(
     let inference_slice = inference_slice.as_ref()?;
     Some(SimulationSummaryManifest {
         supported_runtime_modes: vec!["logits".to_string(), "generate_ids".to_string()],
-        memtorch_stages: projections
+        aihwkit_stages: projections
             .iter()
             .map(|projection| projection.stage.clone())
             .collect(),
         digital_stages: inference_slice.digital_stages.clone(),
-        patched_projection_count: projections.len() as u32,
+        analog_projection_count: projections.len() as u32,
+        decoder_layers: Some(inference_slice.decoder_layers),
+        vocab_size: Some(inference_slice.vocab_size),
         lm_head_target: "digital".to_string(),
     })
+}
+
+fn execution_reason(
+    execution: &crate::lowering::OperationExecution,
+    inference_slice: &Option<InferenceSliceManifest>,
+) -> String {
+    if execution.stage == "lm_head.matmul"
+        && let Some(inference_slice) = inference_slice
+    {
+        return format!(
+            "the vocabulary logits projection stays digital for this token-logits milestone (vocab_size = {})",
+            inference_slice.vocab_size
+        );
+    }
+
+    execution.reason.clone()
 }
 
 fn build_projection_manifest(
@@ -303,14 +360,14 @@ fn build_projection_manifest(
             matrix_shape: [tile.matrix_shape.rows, tile.matrix_shape.cols],
             tile_size: [tile.tile_size.rows, tile.tile_size.cols],
             weight_offset: tile.weight_offset,
-            quant_scale: tile.quant_scale,
+            byte_len: tile.tile_size.payload_bytes(),
             order: tile.order,
         })
         .collect::<Vec<_>>();
 
     if tiles.is_empty() {
         return Err(format!(
-            "projection `{}` has no lowered MemTorch tiles",
+            "projection `{}` has no lowered AIHWKIT tiles",
             projection.name
         ));
     }
@@ -331,15 +388,17 @@ fn build_projection_manifest(
 pub fn build_package(
     normalized: &NormalizedProgram,
     lowered: &LoweredProgram,
-) -> Result<MemtorchPackage, String> {
+) -> Result<AihwkitPackage, String> {
     let first_dispatch = lowered
         .program
         .entry
         .dispatches
         .first()
-        .ok_or_else(|| "cannot build MemTorch package for empty cim program".to_string())?;
+        .ok_or_else(|| "cannot build AIHWKIT package for empty cim program".to_string())?;
     let projections = build_projection_manifests(normalized, lowered)?;
-    let (digital_tensors, digital) = build_digital_tensors(normalized)?;
+    let (digital_tensors, digital) = build_digital_tensors(normalized);
+    let inference_slice = build_inference_slice(normalized);
+    let model_topology = build_model_topology(&inference_slice);
     let execution_plan = lowered
         .execution_plan
         .iter()
@@ -348,25 +407,34 @@ pub fn build_package(
             stage: execution.stage.clone(),
             parent: execution.parent.clone(),
             target: execution.target.clone(),
-            reason: execution.reason.clone(),
+            reason: execution_reason(execution, &inference_slice),
             shape: execution.shape,
             tile_count: execution.tile_count,
         })
         .collect::<Vec<_>>();
 
-    let inference_slice = build_inference_slice(normalized);
     let simulation_summary = build_simulation_summary(&inference_slice, &projections);
+    let tile_size = [first_dispatch.tile_size.rows, first_dispatch.tile_size.cols];
 
-    let manifest = MemtorchManifest {
+    let manifest = AihwkitManifest {
         schema_version: 1,
+        backend: "aihwkit".to_string(),
         entry: normalized.name.clone(),
-        tile_size: [first_dispatch.tile_size.rows, first_dispatch.tile_size.cols],
-        quant_bits: lowered.quant_bits,
-        weights_file: "memtorch_weights.bin".to_string(),
+        model_topology,
+        tile_size,
+        weight_dtype: "f32".to_string(),
+        weights_file: "aihwkit_weights.bin".to_string(),
         digital_tensors_file: if digital.is_empty() {
             None
         } else {
-            Some("memtorch_digital.bin".to_string())
+            Some("aihwkit_digital.bin".to_string())
+        },
+        rpu_config: RpuConfigManifest {
+            preset: "ideal_torch_inference".to_string(),
+            analog_module: "AnalogLinearMapped".to_string(),
+            max_input_size: tile_size[1],
+            max_output_size: tile_size[0],
+            digital_bias: true,
         },
         projections,
         digital_tensors,
@@ -400,20 +468,20 @@ pub fn build_package(
         simulation_summary,
     };
 
-    Ok(MemtorchPackage {
+    Ok(AihwkitPackage {
         manifest,
         weights: tile_payload_bytes(&lowered.tiles),
         digital,
     })
 }
 
-pub fn manifest_json(manifest: &MemtorchManifest) -> Result<String, String> {
+pub fn manifest_json(manifest: &AihwkitManifest) -> Result<String, String> {
     serde_json::to_string_pretty(manifest)
         .map(|mut json| {
             json.push('\n');
             json
         })
-        .map_err(|err| format!("failed to serialize MemTorch manifest: {err}"))
+        .map_err(|err| format!("failed to serialize AIHWKIT manifest: {err}"))
 }
 
 #[cfg(test)]
@@ -433,16 +501,17 @@ mod tests {
                     .unwrap(),
             )],
         );
-        let lowered = lower_program(&normalized, CompileConfig::square(1, 8)).unwrap();
+        let lowered = lower_program(&normalized, CompileConfig::square(1)).unwrap();
         let package = build_package(&normalized, &lowered).unwrap();
 
         assert_eq!(package.manifest.schema_version, 1);
+        assert_eq!(package.manifest.backend, "aihwkit");
         assert_eq!(package.manifest.projections[0].tiles.len(), 2);
-        assert_eq!(package.weights.len(), 2);
+        assert_eq!(package.weights.len(), 8);
         assert!(
             manifest_json(&package.manifest)
                 .unwrap()
-                .contains("memtorch_weights.bin")
+                .contains("aihwkit_weights.bin")
         );
     }
 }

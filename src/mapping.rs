@@ -12,11 +12,9 @@ pub fn choose_projection_target(
     projection: &ProjectionOp,
     tile_rows: u32,
     tile_cols: u32,
-    bits: u32,
 ) -> MappingDecision {
     let tiles = (projection.rows.div_ceil(tile_rows) * projection.cols.div_ceil(tile_cols)) as f32;
-    let quant_penalty = if bits == 4 { 0.15 } else { 0.05 };
-    let cim_cost = tiles * (1.0 + quant_penalty);
+    let cim_cost = tiles;
     let digital_cost = projection.rows as f32 * projection.cols as f32;
     MappingDecision {
         target: ExecutionTarget::Cim,

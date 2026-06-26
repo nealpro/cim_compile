@@ -11,7 +11,6 @@ fn tiny_dispatch(order: u32, row: u32, col: u32) -> TileDispatch {
         matrix_shape: MatrixShape::new(2, 2),
         tile_size: TileSize::new(1, 1),
         weight_offset: expected_weight_offset(order, TileSize::new(1, 1)),
-        quant_scale: 1.0,
         order,
     }
 }
@@ -32,10 +31,10 @@ fn tiny_program() -> Program {
 const EXPECTED_TINY_TEXT: &str = concat!(
     "cim.module @dialect_test {\n",
     "  cim.func @dispatch {\n",
-    "    cim.tile.dispatch { projection = \"wq\", tile = [0, 0], matrix_shape = [2, 2], tile_size = [1, 1], weight_offset = 0, quant_scale = 1.0, order = 0 }\n",
-    "    cim.tile.dispatch { projection = \"wq\", tile = [0, 1], matrix_shape = [2, 2], tile_size = [1, 1], weight_offset = 1, quant_scale = 1.0, order = 1 }\n",
-    "    cim.tile.dispatch { projection = \"wq\", tile = [1, 0], matrix_shape = [2, 2], tile_size = [1, 1], weight_offset = 2, quant_scale = 1.0, order = 2 }\n",
-    "    cim.tile.dispatch { projection = \"wq\", tile = [1, 1], matrix_shape = [2, 2], tile_size = [1, 1], weight_offset = 3, quant_scale = 1.0, order = 3 }\n",
+    "    cim.tile.dispatch { projection = \"wq\", tile = [0, 0], matrix_shape = [2, 2], tile_size = [1, 1], weight_offset = 0, order = 0 }\n",
+    "    cim.tile.dispatch { projection = \"wq\", tile = [0, 1], matrix_shape = [2, 2], tile_size = [1, 1], weight_offset = 4, order = 1 }\n",
+    "    cim.tile.dispatch { projection = \"wq\", tile = [1, 0], matrix_shape = [2, 2], tile_size = [1, 1], weight_offset = 8, order = 2 }\n",
+    "    cim.tile.dispatch { projection = \"wq\", tile = [1, 1], matrix_shape = [2, 2], tile_size = [1, 1], weight_offset = 12, order = 3 }\n",
     "  }\n",
     "}\n",
 );
@@ -110,5 +109,5 @@ fn cim_expected_weight_offsets_match_layout() {
     let tile_size = TileSize::new(1, 1);
 
     assert_eq!(expected_weight_offset(0, tile_size), 0);
-    assert_eq!(expected_weight_offset(3, tile_size), 3);
+    assert_eq!(expected_weight_offset(3, tile_size), 12);
 }

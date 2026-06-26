@@ -73,7 +73,7 @@ impl TileSize {
     }
 
     pub fn payload_bytes(self) -> u64 {
-        self.rows as u64 * self.cols as u64
+        self.rows as u64 * self.cols as u64 * std::mem::size_of::<f32>() as u64
     }
 }
 
@@ -96,7 +96,6 @@ pub struct TileDispatch {
     pub matrix_shape: MatrixShape,
     pub tile_size: TileSize,
     pub weight_offset: u64,
-    pub quant_scale: f32,
     pub order: u32,
 }
 
@@ -223,7 +222,6 @@ fn parse_dispatch_line(line: &str) -> Result<TileDispatch, String> {
             .map(|(rows, cols)| MatrixShape::new(rows, cols))?,
         tile_size: parse_pair(&map, "tile_size").map(|(rows, cols)| TileSize::new(rows, cols))?,
         weight_offset: parse_required::<u64>(&map, "weight_offset")?,
-        quant_scale: parse_required::<f32>(&map, "quant_scale")?,
         order: parse_required::<u32>(&map, "order")?,
     })
 }
@@ -311,7 +309,7 @@ fn print_program(program: &Program) -> String {
     out.push_str(&format!("  cim.func @{} {{\n", program.entry.name));
     for op in dispatches {
         out.push_str(&format!(
-            "    cim.tile.dispatch {{ projection = \"{}\", tile = [{}, {}], matrix_shape = [{}, {}], tile_size = [{}, {}], weight_offset = {}, quant_scale = {:?}, order = {} }}\n",
+            "    cim.tile.dispatch {{ projection = \"{}\", tile = [{}, {}], matrix_shape = [{}, {}], tile_size = [{}, {}], weight_offset = {}, order = {} }}\n",
             op.projection,
             op.tile.row,
             op.tile.col,
@@ -320,7 +318,6 @@ fn print_program(program: &Program) -> String {
             op.tile_size.rows,
             op.tile_size.cols,
             op.weight_offset,
-            op.quant_scale,
             op.order
         ));
     }
@@ -360,12 +357,6 @@ fn verify_program(program: &Program) -> Result<(), String> {
             return Err(format!(
                 "projection {} uses inconsistent matrix_shape values",
                 op.projection
-            ));
-        }
-        if !op.quant_scale.is_finite() || op.quant_scale <= 0.0 {
-            return Err(format!(
-                "dispatch order {} has invalid quant_scale {}",
-                op.order, op.quant_scale
             ));
         }
         if op.order as usize >= dispatch_count {
@@ -462,7 +453,6 @@ mod tests {
             matrix_shape: MatrixShape::new(2, 2),
             tile_size: TileSize::new(1, 1),
             weight_offset: expected_weight_offset(order, TileSize::new(1, 1)),
-            quant_scale: 1.0,
             order,
         }
     }
