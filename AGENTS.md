@@ -8,7 +8,7 @@ Build `cim_compile` into a real domain compiler for compute-in-memory simulation
 ONNX model -> MLIR-based normalized model IR -> reusable CiM/circuit dialect -> AIHWKIT simulation package
 ```
 
-The end goal is more important than the current narrow implementation. Existing tiny-decoder and MemTorch paths are transitional scaffolding; preserve them when useful for compatibility, but do not let them define new architecture.
+The end goal is more important than the current narrow implementation. Existing tiny-decoder and MemTorch paths are transitional scaffolding; do not preserve them for compatibility.
 
 ## MLIR Direction
 
