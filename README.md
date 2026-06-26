@@ -3,164 +3,103 @@
 [![Version](https://img.shields.io/badge/version-0.1.0-blue)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-2024-orange)](rust-toolchain.toml)
 [![CI](https://github.com/nealpro/cim_compile/actions/workflows/ci.yml/badge.svg)](https://github.com/nealpro/cim_compile/actions/workflows/ci.yml)
-[![Target](https://img.shields.io/badge/target-MemTorch%20simulation-lightgrey)](https://memtorch.readthedocs.io/en/latest/)
+[![Target](https://img.shields.io/badge/target-AIHWKIT%20simulation-lightgrey)](https://aihwkit.readthedocs.io/en/latest/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ## TL;DR
 
-`cim_compile` is a small local compiler that turns a supported ONNX tiny-decoder slice into a verified compute-in-memory simulation package. It extracts the first decoder layer from `data/model.onnx`, lowers CiM-friendly attention and MLP projections into a strict `cim` dialect, and emits the files needed to run those projection layers through MemTorch while digital PyTorch handles embedding lookup, RMSNorm, rotary math, attention score/softmax/context kernels, residual glue, and the final LM-head logits projection. On this MacBook Air, the CPU MemTorch path has been installed and validated for token-ID-to-logits inference on the supported fixture path; CUDA validation belongs on a CUDA machine. The project intentionally supports a narrow slice first, so failures are explicit and the compiler can be tested deeply instead of pretending to handle every ONNX graph.
-
-## Overview
-
-### The Problem
-
-Memristive compute-in-memory systems represent matrix weights as device conductances inside crossbar arrays. That makes the important compiler problem different from normal CPU code generation: the compiler must decide how matrices become crossbar tiles, preserve that schedule, and hand the result to a simulator that understands memristive behavior.
-
-### What This Tool Does
-
-1. **Frontend** — Reads a small ONNX/prost slice and extracts supported projection and digital fallback weights from the first named tiny decoder block.
-2. **Normalization** — Converts the supported graph pattern into a local `NormalizedProgram` with explicit attention, MLP, and token-logits metadata.
-3. **`cim` dialect** — Lowers CiM-friendly projections into verified `cim.tile.dispatch` operations with explicit tile and scheduling attributes.
-4. **MemTorch package** — Writes a manifest, execution plan, and quantized tile payloads.
-5. **Simulation run** — Optionally invokes the checked-in Python MemTorch bridge with `--run-memtorch` when Torch and MemTorch are installed in the selected Python environment.
-
-## Key Features
-
-- **One clean target** — The active path is `ONNX -> normalized IR -> cim dialect -> MemTorch package`; the old RV32I hardware backend is no longer part of the compiler.
-- **Transformer-aware offload** — The supported decoder slice is normalized explicitly, with CiM assigned to static attention/MLP projections and digital fallback recorded for dynamic kernels.
-- **Real tiny-model logits path** — The local `data/model.onnx` fixture compiles as one hybrid decoder layer with 192-wide hidden state, 1024-wide MLP intermediate state, 32k vocabulary logits, and grouped-query attention metadata when ignored validation tests are run manually.
-- **Strict dialect verifier** — Rejects invalid tile sizes, out-of-bounds tiles, missing or duplicate orders, inconsistent schedules, bad scales, duplicate coverage, and offset mistakes while allowing padded edge tiles.
-- **Stable text IR** — `output.cim` has an MLIR-like textual form with parser/printer round-trip tests.
-- **MemTorch-oriented artifacts** — Emits `memtorch_manifest.json`, `memtorch_weights.bin`, optional `memtorch_digital.bin`, and an execution plan that records CiM versus digital placement.
-- **Narrow ONNX support** — Accepts the real tiny-model token-ID logits slice, bundled MHA-style projection fixtures, single rank-2 float projection initializers, and linear `MatMul`/`Gemm` nodes with initializer weights.
-- **Clear unsupported-op diagnostics** — Unsupported ONNX ops fail with the node name and supported-op list.
-- **CI-safe tests** — `cargo test` uses generated/minimal ONNX fixtures, golden outputs, parser/verifier checks, CLI artifact checks, and clear unsupported-op diagnostics without requiring a large model download.
-
-## Tech Stack
-
-| Layer | Technology |
-|---|---|
-| Language | Rust 2024 |
-| CLI | `clap` 4 derive API |
-| Serialization | `serde` + `serde_json` |
-| ONNX protobuf ingestion | `prost` 0.14 |
-| Protobuf code generation | `prost-build` + `protoc-bin-vendored` |
-| Simulation target | MemTorch via checked-in Python bridge + PyTorch model reconstruction |
-| Package manager | Cargo; uv for optional Python simulation dependencies |
-
-## Project Structure
+`cim_compile` is a local compiler prototype for compute-in-memory simulation. The active path is:
 
 ```text
-cim_compile/
-├── src/
-│   ├── lib.rs              ← Public `compile_onnx` API
-│   ├── main.rs             ← Thin CLI wrapper
-│   ├── frontend.rs         ← Narrow ONNX parser and normalizer
-│   ├── ir.rs               ← Normalized internal IR
-│   ├── cim.rs              ← Dialect data model, verifier, parser, printer
-│   ├── lowering.rs         ← Tiling, schedule order, quantization, tile payloads
-│   └── memtorch.rs         ← Manifest, CiM tile bytes, and digital tensor bytes
-├── python/
-│   └── cim_compile_memtorch/ ← Python MemTorch runtime bridge
-├── tests/
-│   ├── cim.rs              ← Dialect parser/printer/verifier tests
-│   ├── cli.rs              ← End-to-end CLI artifact tests
-│   ├── golden.rs           ← Exact tiny-projection golden outputs
-│   ├── full.rs             ← Ignored local validation for data/model.onnx + MemTorch
-│   └── generate_onnx_fixtures.py ← Runtime ONNX fixture generator
-├── proto/                  ← Minimal ONNX protobuf schema
-├── build.rs                ← Protobuf codegen setup
-└── LINKS.md                ← Reference links
+ONNX model slice -> NormalizedProgram -> verified cim dialect -> AIHWKIT simulation package
 ```
+
+The compiler extracts supported static-weight projections, schedules them as `cim.tile.dispatch` operations, emits deterministic full-precision tile payloads, and can invoke a checked-in Python AIHWKIT bridge. Dynamic activation work such as embedding lookup, RMSNorm, rotary math, attention score/softmax/context kernels, residual glue, and LM-head logits remains explicit digital PyTorch fallback for the current tiny-decoder slice.
+
+## Current Scope
+
+- Rust frontend for a deliberately narrow ONNX/prost slice.
+- Normalized IR for supported projection, attention, MLP, and token-logits metadata.
+- Stable MLIR-like `output.cim` text with parser/printer/verifier tests.
+- AIHWKIT package artifacts: `aihwkit_manifest.json`, `aihwkit_weights.bin`, and optional `aihwkit_digital.bin`.
+- Python bridge at `python/cim_compile_aihwkit/runner.py` that reconstructs AIHWKIT `AnalogLinearMapped` layers and runs the supported projection, attention, logits, and greedy token-ID generation paths.
+- Default AIHWKIT runtime config is an ideal mapped inference configuration so v1 validates compiler plumbing deterministically before realistic device/noise presets are added.
+
+The old hardware/RV32I code is retained as transitional scaffolding. New simulator work should target AIHWKIT.
 
 ## Installation
 
-Prerequisites for compiling artifacts:
+Rust prerequisites:
 
 - Rust stable with edition 2024 support
 - Cargo
 
 ```bash
-git clone <repo-url>
-cd cim_compile
-cargo build --release
+cargo build
 cargo test
 ```
 
-Python prerequisites for tests, ignored real-model validation, and `--run-memtorch`:
+Python prerequisites for `--run-aihwkit` and ignored full-model validation:
 
-- Python 3 for the default pure-stdlib ONNX fixture generator
-- PyTorch for ignored real-model/MemTorch validation and Torch-exported fixtures
-- ONNX and `onnxscript` for Torch export
-- MemTorch CPU on this laptop, or CUDA MemTorch on a CUDA machine, for `--run-memtorch`
+- Python 3.10+
+- PyTorch
+- IBM AIHWKIT
+- Optional: Hugging Face `transformers` for `--prompt-text`, `--tokenizer`, and `--decode-text`
+- Optional: `sentencepiece` when the supplied local tokenizer requires it
 
-MemTorch is documented at [memtorch.readthedocs.io](https://memtorch.readthedocs.io/en/latest/). The default Rust test suite is CI-safe: it generates minimal ONNX protobuf fixtures with the Python standard library and does not require `data/model.onnx`. Ignored local validation tests can exercise a real model by setting `CIM_COMPILE_REAL_MODEL=/path/to/model.onnx`. `--run-memtorch` requires Torch and MemTorch.
-
-The local CPU simulation environment used for validation was installed with:
-
-```bash
-uv pip install torch onnx onnxscript
-uv pip install --no-deps --no-build-isolation memtorch-cpu
-uv pip install pandas scipy scikit-learn torchvision matplotlib seaborn ipython lmfit
-```
-
-That environment currently imports `torch 2.12.1`, `onnx 1.22.0`, `onnxscript 0.7.0`, and `memtorch 1.1.6-cpu`. `uv pip check` still reports MemTorch's historical `sklearn` package alias as missing; runtime uses `scikit-learn` and the full MemTorch test passes.
+The bridge imports AIHWKIT and tokenizer dependencies lazily, so normal Rust checks do not require Python simulator packages.
 
 ## Quick Start
 
-**Compile the required real tiny-model token-logits slice**
+Compile a supported real tiny-decoder model:
 
 ```bash
 cargo run --release -- data/model.onnx -o out --tile-size 128
 ```
 
-This extracts the first decoder layer, maps Q/K/V/output and MLP gate/up/down projections to CiM tiles, packages embedding/norm/LM-head tensors for digital fallback, and records score matmul, masking, softmax, grouped-query repeat, context matmul, MLP activation, residuals, and logits projection as digital stages. The default `128 x 128` tile size produces padded edge tiles for the model's `192 x 192`, `96 x 192`, `1024 x 192`, and `192 x 1024` projection matrices. You can also simulate with larger crossbars, for example `--tile-size 192`, when that is the experiment you want to show.
-
-**Run token-ID-to-logits inference through the MemTorch bridge**
+Run token-ID-to-logits inference through AIHWKIT:
 
 ```bash
-cargo run --release -- data/model.onnx -o out --tile-size 128 --run-memtorch --input-ids 1,2,3,4 --top-k 5
+cargo run --release -- data/model.onnx -o out --tile-size 128 --run-aihwkit --input-ids 1,2,3,4 --top-k 5
 ```
 
-The JSON result reports `logits_shape: [1, 4, 32000]` and `next_token_topk` for the last input token.
-
-**Run greedy token-ID generation before tokenizer support**
+Run greedy token-ID generation:
 
 ```bash
-cargo run --release -- data/model.onnx -o out --tile-size 128 --run-memtorch --generate-ids --input-ids 1,2,3,4 --max-new-tokens 8 --top-k 5
+cargo run --release -- data/model.onnx -o out --tile-size 128 --run-aihwkit --generate-ids --input-ids 1,2,3,4 --max-new-tokens 8 --top-k 5
 ```
 
-The JSON result reports `generated_ids`, `new_token_ids`, `per_step_topk`, `cache_shapes`, and a `simulation_summary`. This is still not text generation: there is no tokenizer, text prompt handling, non-greedy sampling UI, external KV-cache API, or arbitrary ONNX LLM support in scope.
+Run an interactive token-ID session:
 
-**Compile the bundled unrolled projection fixture**
+```bash
+cargo run --release -- data/model.onnx -o out --tile-size 128 --run-aihwkit --interactive-ids --max-new-tokens 4 --top-k 5
+```
+
+The prompt accepts comma-separated token IDs. Enter `quit` or press Ctrl-D to exit.
+
+Run text mode with an external compatible tokenizer:
+
+```bash
+cargo run --release -- data/model.onnx -o out --tile-size 128 --run-aihwkit --generate-ids --prompt-text "Hello" --tokenizer /path/to/tokenizer --decode-text --max-new-tokens 8
+```
+
+Run an interactive text session:
+
+```bash
+cargo run --release -- data/model.onnx -o out --tile-size 128 --run-aihwkit --interactive-text --tokenizer /path/to/tokenizer --max-new-tokens 8 --top-k 5
+```
+
+No tokenizer artifacts are bundled with `data/model.onnx`; text mode requires a local Hugging Face-compatible `--tokenizer` whose vocabulary matches the emitted manifest.
+
+Generate and compile bundled ONNX fixtures:
 
 ```bash
 python3 tests/generate_onnx_fixtures.py --output-dir /tmp/cim-fixtures --dim 512
 cargo run --release -- /tmp/cim-fixtures/memristor_mha_unrolled.onnx -o out
-```
-
-**Compile the fused QKV fixture**
-
-```bash
 cargo run --release -- /tmp/cim-fixtures/mha_bfloat16.onnx -o out-fused
 ```
 
-**Use a smaller simulated crossbar tile**
-
-```bash
-python3 tests/generate_onnx_fixtures.py --output-dir /tmp/cim-fixtures-64 --dim 64
-cargo run --release -- /tmp/cim-fixtures-64/memristor_mha_unrolled.onnx -o out-64 --tile-size 64
-```
-
-**Run the MemTorch bridge**
-
-```bash
-cargo run --release -- /tmp/cim-fixtures/memristor_mha_unrolled.onnx -o out --run-memtorch
-```
-
-If Python cannot import Torch and MemTorch, the command still writes the compiler artifacts and then reports the missing simulation dependency.
-
-## CLI / API Reference
+## CLI
 
 ```text
 cim_compile [OPTIONS] <ONNX_PATH>
@@ -169,14 +108,18 @@ Arguments:
   <ONNX_PATH>              Path to the ONNX model file
 
 Options:
-  -o, --output-dir <DIR>   Output directory for output.cim and MemTorch artifacts [default: .]
+  -o, --output-dir <DIR>   Output directory for output.cim and AIHWKIT artifacts [default: .]
       --tile-size <N>      Square crossbar tile dimension [default: 128]
-      --bits <N>           Quantization bit-width for tile payloads: 4 or 8 [default: 8]
-      --run-memtorch       Run the MemTorch bridge after writing artifacts
-      --python <PYTHON>    Python executable to use with --run-memtorch
-      --input-ids <CSV>    Comma-separated token IDs for --run-memtorch [default: 1,2,3,4]
+      --run-aihwkit        Run the AIHWKIT bridge after writing artifacts
+      --python <PYTHON>    Python executable to use with --run-aihwkit
+      --input-ids <CSV>    Comma-separated token IDs, not prompt text, for --run-aihwkit
+      --interactive-ids    Let the Python runner prompt interactively for token IDs
+      --interactive-text   Let the Python runner prompt interactively for prompt text
+      --prompt-text <TEXT> Prompt text for text/tokenizer mode
+      --tokenizer <PATH>   Local tokenizer path for text/tokenizer mode
+      --decode-text        Decode generated token IDs back to text
       --top-k <N>          Number of next-token candidates to report [default: 5]
-      --generate-ids       Generate token IDs greedily with the MemTorch bridge
+      --generate-ids       Generate token IDs greedily with the AIHWKIT bridge
       --max-new-tokens <N> Maximum number of token IDs to generate [default: 8]
       --eos-token-id <ID>  Optional token ID that stops generation early
   -h, --help               Print help
@@ -186,116 +129,87 @@ Options:
 Library entry point:
 
 ```rust
-let compilation = cim_compile::compile_onnx(path, cim_compile::CompileConfig::square(128, 8))?;
+let compilation = cim_compile::compile_onnx(path, cim_compile::CompileConfig::square(128))?;
 ```
 
-`Compilation` contains the normalized IR, verified `cim::Program`, and MemTorch package bytes/text.
+`Compilation` contains the normalized IR, verified `cim::Program`, and AIHWKIT package bytes/text.
 
-## Core Algorithm / How It Works
+## `data/model.onnx` Runtime Contract
 
-The compiler treats each supported projection matrix as a sheet of weights that must be cut into crossbar-sized tiles. Each tile gets a deterministic schedule order and byte offset. Edge tiles are zero-padded to the selected physical crossbar shape. The checked-in Python MemTorch bridge reconstructs PyTorch `Linear` layers from those tile bytes, asks MemTorch to patch them into a memristive simulation model, and runs token-ID logits or greedy token-ID generation for the supported tiny decoder slice. During generation, the bridge maintains a one-layer digital KV cache while continuing to call MemTorch-patched attention and MLP projections.
+The checked-in model is a one-layer tiny decoder exported from PyTorch with token-ID inputs. The supported interactive contract is batch size 1, token IDs in `0..31999`, and logits shaped `[1, sequence_length, 32000]`. The runner owns an internal one-layer KV cache during greedy generation; external/non-empty KV-cache inputs are not a supported user-facing API yet.
 
-Technical flow:
+Text generation is available only when the user supplies a compatible external tokenizer through `--tokenizer`. Without that, the reliable interface is token IDs in and token IDs/top-k IDs out.
 
-```text
-ONNX graph/initializers
-  -> NormalizedProgram
-  -> verified cim::Program
-  -> MemTorch manifest + quantized tile bytes + digital tensor bytes
-```
-
-Example `cim` operation:
-
-```text
-cim.tile.dispatch { projection = "wq", tile = [0, 0], matrix_shape = [192, 192], tile_size = [128, 128], weight_offset = 0, quant_scale = 0.006597564, order = 0 }
-```
-
-The offset is into `memtorch_weights.bin`, which stores tile payloads in dispatch order with no legacy hardware header.
-
-## Configuration
-
-There is no config file. The compiler is configured through CLI flags or `CompileConfig`.
-
-| Option | Meaning |
-|---|---|
-| `--tile-size <N>` | Uses `N x N` physical crossbar tiles; edge tiles are zero-padded when the matrix shape is not evenly divisible. |
-| `--bits <N>` | Quantizes float weights to signed 4-bit or 8-bit ranges, stored as one byte per weight. |
-| `--output-dir <DIR>` | Writes generated artifacts into the selected directory. |
-| `--run-memtorch` | Runs `python -m cim_compile_memtorch.runner` after compiling. |
-| `--python <PYTHON>` | Selects the Python executable for `--run-memtorch`; if omitted, the CLI uses `.venv/bin/python` when present, then falls back to `python3`. The CLI sets `PYTHONPATH` to include the repo's `python/` directory. |
-| `--input-ids <CSV>` | Token IDs to feed into the supported logits simulation when `--run-memtorch` is set. |
-| `--top-k <N>` | Number of last-token candidates to report from the logits tensor. |
-| `--generate-ids` | Runs greedy token-ID generation instead of only reporting prompt logits. |
-| `--max-new-tokens <N>` | Maximum number of new IDs to generate in greedy mode. |
-| `--eos-token-id <ID>` | Optional generated ID that stops greedy generation early. |
-
-## Output Reference
+## Artifacts
 
 ### `output.cim`
 
-Stable text form of the verified `cim` dialect. This is intended for inspection and parser/verifier round-trip tests.
+Stable text form of the verified `cim` dialect. Example:
 
-### `memtorch_manifest.json`
+```text
+cim.tile.dispatch { projection = "wq", tile = [0, 0], matrix_shape = [192, 192], tile_size = [128, 128], weight_offset = 0, order = 0 }
+```
 
-JSON manifest consumed by the checked-in MemTorch bridge.
+`weight_offset` is a byte offset into `aihwkit_weights.bin`.
+
+### `aihwkit_manifest.json`
+
+JSON manifest consumed by the AIHWKIT bridge. It includes:
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | Manifest schema version, currently `1`. |
-| `entry` | Normalized program name. |
-| `tile_size` | `[rows, cols]` tile shape used for all dispatches. |
-| `quant_bits` | Quantization bit-width requested at compile time. |
-| `weights_file` | Relative path to `memtorch_weights.bin`. |
-| `digital_tensors_file` | Relative path to `memtorch_digital.bin` when the supported token-logits slice needs digital tensors. |
-| `projections` | Projection metadata, bias values if present, and tile records. |
-| `digital_tensors` | Float tensor metadata for embedding, norm, and LM-head fallback payloads. |
-| `inference_slice` | Narrow supported slice metadata, including token-logits mode and explicit unsupported features. |
-| `simulation_summary` | Runtime placement summary: supported modes, MemTorch stages, digital stages, patched projection count, and LM-head placement. |
+| `schema_version` | Manifest schema version. |
+| `backend` | Always `aihwkit` for the active backend. |
+| `tile_size` | Crossbar tile shape used by compiler scheduling and AIHWKIT mapping. |
+| `weight_dtype` | `f32`; AIHWKIT owns analog programming and device simulation. |
+| `weights_file` | Relative path to `aihwkit_weights.bin`. |
+| `digital_tensors_file` | Relative path to `aihwkit_digital.bin` when digital fallback tensors are needed. |
+| `rpu_config` | Default ideal mapped inference config metadata. |
+| `projections` | Static-weight projections and tile records. |
+| `execution_plan` | CiM versus digital placement records. |
+| `simulation_summary` | Runtime placement summary with `aihwkit_stages` and digital stages. |
 
-Each tile record includes `row`, `col`, `matrix_shape`, `tile_size`, `weight_offset`, `quant_scale`, and `order`. Attention manifests also include per-block metadata such as hidden size, Q/KV dimensions, head counts, and whether grouped-query attention is present.
+Each tile record includes `row`, `col`, `matrix_shape`, `tile_size`, `weight_offset`, `byte_len`, and `order`.
 
-### `memtorch_weights.bin`
+### `aihwkit_weights.bin`
 
-Raw signed int8 tile payloads in dispatch order. A tile with order `k` starts at:
+Raw `f32` little-endian tile payloads in dispatch order. A tile with order `k` starts at:
 
 ```text
-k * tile_rows * tile_cols
+k * tile_rows * tile_cols * 4
 ```
 
-### `memtorch_digital.bin`
+Edge tiles are zero-padded to the selected physical tile shape.
+
+### `aihwkit_digital.bin`
 
 Float32 little-endian tensor payloads for digital fallback. The manifest records each tensor role, shape, byte offset, byte length, and dtype.
 
-### Python MemTorch Bridge
+## Testing
 
-`python/cim_compile_memtorch/runner.py` reconstructs PyTorch `Linear` layers from the manifest and weight payloads, loads digital tensors from `memtorch_digital.bin` when present, then uses MemTorch's `patch_model` path when the Python environment has the required packages. The compiler does not emit Python code into the output directory.
-
-## Testing & Validation
-
-Run the default CI-safe suite:
+Default tests generate small ONNX fixtures and do not require AIHWKIT or a local model:
 
 ```bash
 cargo test
 ```
 
-Coverage includes runtime-generated ONNX fixture ingestion, normalized lowering, bfloat16/f32 quantization, schedule generation, offset validation, `cim` parser/printer round trips, verifier failures, CLI success and failure cases, unavailable Python bridge diagnostics, and exact golden outputs for a tiny projection. It deliberately does not require `data/model.onnx` or download any model artifact.
+CI-equivalent non-test Rust checks:
 
-Run ignored real-model checks manually when you have a local model:
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo check --workspace --all-targets --all-features
+```
+
+Ignored full validation tests require a local real model and Python environment with AIHWKIT:
 
 ```bash
 CIM_COMPILE_REAL_MODEL=data/model.onnx cargo test -- --ignored
 CIM_COMPILE_REAL_MODEL=data/model.onnx cargo test --test full -- --ignored
 ```
 
-The full MemTorch test also requires Torch and MemTorch in the selected Python environment. The current local fixture came from https://huggingface.co/onnx-community/Tiny-LLM-ONNX/resolve/main/onnx/model.onnx, but large model files remain local/manual validation assets rather than CI inputs.
+Large model files remain local/manual validation assets rather than CI inputs.
 
-## Documentation Index
+## References
 
-| Document | Contents |
-|---|---|
-| [LINKS.md](LINKS.md) | Reference links for ONNX, MLIR-style IRs, MemTorch, CiM context, and compiler architecture. |
-| [NOTES.md](NOTES.md) | Current milestone state, design decisions, local Python environment, and test counts. |
-
-## License
-
-Released under the [MIT License](LICENSE).
+See [LINKS.md](LINKS.md) for ONNX, MLIR, AIHWKIT, CiM, and compiler architecture references.
