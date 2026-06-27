@@ -24,7 +24,7 @@ This starts the backend pivot to IBM AIHWKIT. The compiler still supports a narr
 ## Design Decisions
 
 - AIHWKIT owns analog programming, mapping, and non-ideality simulation. The compiler emits deterministic f32 tile payloads, not int4/int8 quantized simulator payloads.
-- The ONNX-to-MLIR direction is tracked in `docs/research/mlir_path.md`: keep the thin Rust frontend for `data/model.onnx` near term, add an out-of-tree MLIR dialect spike, and prefer ONNX-MLIR as a tool/output boundary long term over building a full ONNX dialect here.
+- The ONNX-to-MLIR direction is tracked in project notes and `LINKS.md`: keep the thin Rust frontend for `data/model.onnx` near term, add an out-of-tree MLIR dialect spike, and prefer ONNX-MLIR as a tool/output boundary long term over building a full ONNX dialect here.
 - The current custom `cim` text is transitional. It is a deterministic compiler boundary for today, but parser/printer/verifier/schema ownership should move to MLIR ODS/TableGen once the dialect spike is proven.
 - Each `cim.tile.dispatch` carries `projection`, `tile`, `matrix_shape`, `tile_size`, `weight_offset`, and `order`.
 - `weight_offset` is a byte offset. For fixed-size f32 tiles, `payload_offset = order * tile_rows * tile_cols * 4`.

@@ -16,6 +16,12 @@
 | IBM AIHWKIT repository | https://github.com/IBM/aihwkit | Local clone is available under `aihwkit/` for API reference |
 | CrossSim | https://github.com/sandialabs/cross-sim | Analog crossbar simulation reference for validation questions and backend comparison |
 
+## Local Validation Fixtures
+
+| Resource | URL | Notes |
+|----------|-----|-------|
+| Tiny LLM ONNX model | https://huggingface.co/onnx-community/Tiny-LLM-ONNX/resolve/main/onnx/model.onnx | Source for the local ignored `data/model.onnx` validation fixture |
+
 ## Compiler Architecture / IR Design
 
 | Resource | URL | Notes |
