@@ -1,7 +1,7 @@
 # cim_compile
 
 [![Version](https://img.shields.io/badge/version-0.1.0-blue)](Cargo.toml)
-[![Rust](https://img.shields.io/badge/rust-2024-orange)](rust-toolchain.toml)
+[![Rust](https://img.shields.io/badge/rust-2024-orange)](Cargo.toml)
 [![CI](https://github.com/nealpro/cim_compile/actions/workflows/ci.yml/badge.svg)](https://github.com/nealpro/cim_compile/actions/workflows/ci.yml)
 [![Target](https://img.shields.io/badge/target-AIHWKIT%20simulation-lightgrey)](https://aihwkit.readthedocs.io/en/latest/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -24,8 +24,6 @@ The compiler extracts supported static-weight projections, schedules them as `ci
 - AIHWKIT package artifacts: `aihwkit_manifest.json`, `aihwkit_weights.bin`, and optional `aihwkit_digital.bin`.
 - Python bridge at `python/cim_compile_aihwkit/runner.py` that reconstructs AIHWKIT `AnalogLinearMapped` layers and runs the supported projection, attention, logits, and greedy token-ID generation paths.
 - Default AIHWKIT runtime config is an ideal mapped inference configuration so v1 validates compiler plumbing deterministically before realistic device/noise presets are added.
-
-The old hardware/RV32I code is retained as transitional scaffolding. New simulator work should target AIHWKIT.
 
 ## Installation
 
