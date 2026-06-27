@@ -2,16 +2,10 @@ name: CI
 
 on:
   pull_request:
-    paths-ignore:
-      - "iree"
-      - "iree/**"
   push:
     branches:
       - main
       - master
-    paths-ignore:
-      - "iree"
-      - "iree/**"
 
 permissions:
   contents: read
