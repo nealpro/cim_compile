@@ -49,6 +49,15 @@ Python prerequisites for `--run-aihwkit` and ignored full-model validation:
 
 The bridge imports AIHWKIT and tokenizer dependencies lazily, so normal Rust checks do not require Python simulator packages.
 
+The SmolLM2 prompt path also requires `onnx` and local tokenizer/config files next to the ONNX file:
+
+```bash
+uv pip install --python .venv/bin/python onnx
+```
+
+For the local CUDA-enabled AIHWKIT source build used during development, see
+[`docs/aihwkit_gpu_build.md`](docs/aihwkit_gpu_build.md).
+
 ## Quick Start
 
 Compile a supported real tiny-decoder model:
@@ -91,6 +100,34 @@ cargo run --release -- data/model.onnx -o out --tile-size 128 --run-aihwkit --in
 
 No tokenizer artifacts are bundled with `data/model.onnx`; text mode requires a local Hugging Face-compatible `--tokenizer` whose vocabulary matches the emitted manifest.
 
+Run the SmolLM2 prompt-to-text path:
+
+```bash
+cargo run --release -- --prompt "Hello" --max-new-tokens 8 --temperature 0.8 data/smolLM2/model_fp16.onnx
+```
+
+This path uses the `HuggingFaceTB/SmolLM2-135M-Instruct` ONNX export, specifically [`onnx/model_fp16.onnx`](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct/blob/main/onnx/model_fp16.onnx), with tokenizer/config sidecars from the same Hugging Face model repo. It is a separate hybrid runtime path: tokenizer/control-flow operations stay digital in PyTorch, while selected static projection layers use AIHWKIT `AnalogLinearMapped`. The default analog placement is the first decoder layer; use `CIM_COMPILE_SMOLLM2_ANALOG_LAYERS=all` to attempt all decoder layers. SmolLM2 prompt decoding samples by default with `--temperature 0.8`; pass `--temperature 0` for greedy decoding. Run this path outside restricted sandboxes when using the GPU-enabled AIHWKIT build.
+
+Showcase all decoder projection layers through AIHWKIT:
+
+```bash
+CIM_COMPILE_SMOLLM2_ANALOG_LAYERS=all \
+  cargo run -- --prompt "Explain compute-in-memory in 2 sentences." \
+    --max-new-tokens 180 \
+    --temperature 0.7 \
+    data/smolLM2/model_fp16.onnx
+```
+
+Example output:
+
+```text
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+ Running `target/debug/cim_compile --prompt 'Explain compute-in-memory in 2 sentences.' --max-new-tokens 180 --temperature 0.7 data/smolLM2/model_fp16.onnx`
+loading ONNX initializers from data/smolLM2/model_fp16.onnx
+SmolLM2 runtime ready: device=cuda, active layers=30/30, AIHWKIT analog layers=30/30
+In 2 sentences, compute-in-memory is a technique that allows data to be stored and processed in the same memory as the program running on top of it. This allows for efficient data sharing and reduced memory allocation for computations.
+```
+
 Generate and compile bundled ONNX fixtures:
 
 ```bash
@@ -108,6 +145,7 @@ Arguments:
   <ONNX_PATH>              Path to the ONNX model file
 
 Options:
+      --prompt <PROMPT>    Prompt text for the SmolLM2 prompt-to-text runtime
   -o, --output-dir <DIR>   Output directory for output.cim and AIHWKIT artifacts [default: .]
       --tile-size <N>      Square crossbar tile dimension [default: 128]
       --run-aihwkit        Run the AIHWKIT bridge after writing artifacts
@@ -119,6 +157,7 @@ Options:
       --tokenizer <PATH>   Local tokenizer path for text/tokenizer mode
       --decode-text        Decode generated token IDs back to text
       --top-k <N>          Number of next-token candidates to report [default: 5]
+      --temperature <T>    Sampling temperature for SmolLM2 prompt mode; 0 selects greedy decoding [default: 0.8]
       --generate-ids       Generate token IDs greedily with the AIHWKIT bridge
       --max-new-tokens <N> Maximum number of token IDs to generate [default: 8]
       --eos-token-id <ID>  Optional token ID that stops generation early

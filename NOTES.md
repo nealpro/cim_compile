@@ -20,6 +20,7 @@ This starts the backend pivot to IBM AIHWKIT. The compiler still supports a narr
 - `output.cim` prints/parses stable MLIR-like text with f32 byte offsets into `aihwkit_weights.bin`.
 - The CLI writes `output.cim`, `aihwkit_manifest.json`, `aihwkit_weights.bin`, and optional `aihwkit_digital.bin`.
 - `--run-aihwkit` invokes `python -m cim_compile_aihwkit.runner` and emits JSON with logits/top-k results and optional generated token IDs.
+- `--prompt <TEXT> data/smolLM2/model_fp16.onnx` invokes a separate SmolLM2 prompt runtime that loads local tokenizer/config sidecars, runs greedy text generation, and uses AIHWKIT `AnalogLinearMapped` for selected static decoder projections.
 
 ## Design Decisions
 
@@ -52,6 +53,7 @@ This starts the backend pivot to IBM AIHWKIT. The compiler still supports a narr
 - `--interactive-ids` streams an interactive token-ID generation loop through the Python runner.
 - `--interactive-text --tokenizer <PATH>` streams an interactive prompt-text generation loop through the Python runner.
 - `--prompt-text <TEXT> --tokenizer <PATH>` asks the Python runner to encode prompt text through `transformers.AutoTokenizer` with `local_files_only=True` and emits compact generation JSON.
+- `--prompt <TEXT>` is reserved for the SmolLM2 path and prints generated text directly rather than package JSON. SmolLM2 prompt decoding samples by default with `--temperature 0.8`; `--temperature 0` selects greedy decoding.
 - `--decode-text` decodes generated IDs through the same explicit tokenizer; prompt-text mode can also return decoded generated text because the tokenizer is already required for encoding.
 - `--top-k <N>` selects how many last-token logits candidates the bridge reports; the default is `5`.
 - `--generate-ids` switches the bridge into greedy token-ID generation mode.
@@ -59,6 +61,7 @@ This starts the backend pivot to IBM AIHWKIT. The compiler still supports a narr
 - `--eos-token-id <ID>` optionally stops generation when the selected ID appears.
 - If `--python` is omitted, the CLI uses `.venv/bin/python` when present, otherwise `python3`.
 - The bridge keeps Matplotlib/cache files under the output directory to avoid unwritable home-cache issues in sandboxed runs.
+- A local CUDA-enabled AIHWKIT build is documented in `docs/aihwkit_gpu_build.md`. The proven Fedora 44 path uses GCC 15, CUDA arch `89` for RTX 4080, C++20 CUDA compilation, `RPU_USE_TORCH_BUFFERS=OFF`, and small CUDA 13 compatibility patches in the nested `aihwkit/` checkout.
 
 ## Regression Coverage
 
