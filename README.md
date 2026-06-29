@@ -121,8 +121,7 @@ CIM_COMPILE_SMOLLM2_ANALOG_LAYERS=all \
 Example output:
 
 ```text
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
- Running `target/debug/cim_compile --prompt 'Explain compute-in-memory in 2 sentences.' --max-new-tokens 180 --temperature 0.7 data/smolLM2/model_fp16.onnx`
+--prompt 'Explain compute-in-memory in 2 sentences.' --max-new-tokens 180 --temperature 0.7 data/smolLM2/model_fp16.onnx`
 loading ONNX initializers from data/smolLM2/model_fp16.onnx
 SmolLM2 runtime ready: device=cuda, active layers=30/30, AIHWKIT analog layers=30/30
 In 2 sentences, compute-in-memory is a technique that allows data to be stored and processed in the same memory as the program running on top of it. This allows for efficient data sharing and reduced memory allocation for computations.
