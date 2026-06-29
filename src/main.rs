@@ -14,6 +14,10 @@ struct Cli {
     /// Path to the ONNX model file
     onnx_path: PathBuf,
 
+    /// Prompt text for the SmolLM2 prompt-to-text runtime
+    #[arg(long)]
+    prompt: Option<String>,
+
     /// Output directory for output.cim and AIHWKIT simulation artifacts
     #[arg(short, long, default_value = ".")]
     output_dir: PathBuf,
@@ -58,6 +62,10 @@ struct Cli {
     #[arg(long, default_value_t = 5)]
     top_k: usize,
 
+    /// Sampling temperature for the SmolLM2 prompt runtime; use 0 for greedy decoding
+    #[arg(long, default_value_t = 0.8)]
+    temperature: f32,
+
     /// Generate token IDs greedily with the AIHWKIT bridge
     #[arg(long)]
     generate_ids: bool,
@@ -80,6 +88,10 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let cli = Cli::parse();
+    if cli.prompt.is_some() {
+        return run_smollm2_prompt(&cli);
+    }
+
     if cli.interactive_ids && cli.interactive_text {
         return Err("--interactive-ids and --interactive-text cannot be combined".to_string());
     }
@@ -198,6 +210,36 @@ fn run() -> Result<(), String> {
             }
             print!("{}", String::from_utf8_lossy(&output.stdout));
         }
+    }
+
+    Ok(())
+}
+
+fn run_smollm2_prompt(cli: &Cli) -> Result<(), String> {
+    let prompt = cli
+        .prompt
+        .as_ref()
+        .expect("--prompt path should only run when prompt is present");
+    let python = cli.python.clone().unwrap_or_else(default_python);
+    let status = Command::new(&python)
+        .arg("-m")
+        .arg("cim_compile_aihwkit.smollm2_runner")
+        .arg("--model")
+        .arg(&cli.onnx_path)
+        .arg("--prompt")
+        .arg(prompt)
+        .arg("--max-new-tokens")
+        .arg(cli.max_new_tokens.to_string())
+        .arg("--temperature")
+        .arg(cli.temperature.to_string())
+        .env("PYTHONPATH", python_path_env()?)
+        .status()
+        .map_err(|err| format!("failed to run {python}: {err}"))?;
+
+    if !status.success() {
+        return Err(format!(
+            "SmolLM2 AIHWKIT prompt runtime failed with status {status}"
+        ));
     }
 
     Ok(())

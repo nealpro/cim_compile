@@ -260,10 +260,64 @@ fn cli_help_distinguishes_token_id_and_text_modes() {
     assert!(stdout.contains("token IDs in token-ID mode"));
     assert!(stdout.contains("--interactive-text"));
     assert!(stdout.contains("prompt text in text/tokenizer mode"));
+    assert!(stdout.contains("--prompt <PROMPT>"));
     assert!(stdout.contains("--prompt-text <PROMPT_TEXT>"));
     assert!(stdout.contains("text/tokenizer mode"));
     assert!(stdout.contains("--tokenizer <TOKENIZER>"));
     assert!(stdout.contains("--decode-text"));
+    assert!(stdout.contains("--temperature <TEMPERATURE>"));
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_forwards_prompt_to_smollm2_runner() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script_dir = temp_output_dir("fake_python_smollm2");
+    fs::create_dir_all(&script_dir).expect("failed to create fake python directory");
+    let fake_python = script_dir.join("python");
+    let captured_args = script_dir.join("args.txt");
+    fs::write(
+        &fake_python,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CIM_COMPILE_CAPTURE_ARGS\"\nexit 0\n",
+    )
+    .expect("failed to write fake python");
+    let mut permissions = fs::metadata(&fake_python)
+        .expect("failed to stat fake python")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_python, permissions).expect("failed to chmod fake python");
+
+    let model_path = script_dir.join("model_fp16.onnx");
+    fs::write(&model_path, b"not actually parsed").expect("failed to write fake model");
+    let output = Command::new(env!("CARGO_BIN_EXE_cim_compile"))
+        .arg("--prompt")
+        .arg("hello smollm")
+        .arg("--max-new-tokens")
+        .arg("2")
+        .arg("--temperature")
+        .arg("0.7")
+        .arg("--python")
+        .arg(&fake_python)
+        .arg(&model_path)
+        .env("CIM_COMPILE_CAPTURE_ARGS", &captured_args)
+        .output()
+        .expect("failed to run cim_compile");
+
+    assert!(
+        output.status.success(),
+        "cim_compile failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let args = fs::read_to_string(&captured_args).expect("failed to read captured args");
+    assert!(args.contains("-m\ncim_compile_aihwkit.smollm2_runner\n"));
+    assert!(args.contains("--model\n"));
+    assert!(args.contains(&format!("{}\n", model_path.display())));
+    assert!(args.contains("--prompt\nhello smollm\n"));
+    assert!(args.contains("--max-new-tokens\n2\n"));
+    assert!(args.contains("--temperature\n0.7\n"));
 }
 
 #[test]
